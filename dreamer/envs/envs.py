@@ -2,32 +2,12 @@ import gym
 import dmc2gym
 
 from dreamer.envs.wrappers import *
+import gym
+import gym_minigrid 
+from gym_minigrid.wrappers import ImgActionObsWrapper, RGBImgPartialObsWrapper
+from gym_minigrid.window import Window
 
 
-def make_dmc_env(
-    domain_name,
-    task_name,
-    seed,
-    visualize_reward,
-    from_pixels,
-    height,
-    width,
-    frame_skip,
-    pixel_norm=True,
-):
-    env = dmc2gym.make(
-        domain_name=domain_name,
-        task_name=task_name,
-        seed=seed,
-        visualize_reward=visualize_reward,
-        from_pixels=from_pixels,
-        height=height,
-        width=width,
-        frame_skip=frame_skip,
-    )
-    if pixel_norm:
-        env = PixelNormalization(env)
-    return env
 
 
 def make_atari_env(task_name, skip_frame, width, height, seed, pixel_norm=True):
@@ -52,3 +32,16 @@ def get_env_infos(env):
     else:
         raise Exception
     return obs_shape, discrete_action_bool, action_size
+
+def make_minigrid_env(env):
+    #--- ENV INIT ---#
+        env_name = 'MiniGrid-4-tiles-ad-rooms-v0'
+        print(env_name)
+        env = gym.make(env_name, 3, 4)
+        import inspect, sys
+        print("ENV CODE =", inspect.getfile(env.__class__))
+        env = RGBImgPartialObsWrapper(env)
+        env = ImgActionObsWrapper(env)
+        window = Window(env_name)
+        seed = seed
+
