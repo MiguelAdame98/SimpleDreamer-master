@@ -23,14 +23,16 @@ while not done:
     front_pos = env.front_pos           # (x, y) tuple
     front_cell = env.grid.get(*front_pos)
     if steps < SAFE_STEPS:
+            print("safe",steps)
             if isinstance(front_cell, Wall):
+                
                         # there's a wall ahead → turn
                 env_act = random.choice([0, 1])  # 0=left, 1=right
             else:
                 env_act = 2                      # 2=forward
     else:
         # after SAFE_STEPS, pure random
-        env_act = random.randrange(0,2)           # TODO: your policy
+        env_act = random.randrange(0,3)           # TODO: your policy
     
     obs, reward, done, info = env.step(env_act)    # legacy 4-tuple API
     env.render(tile_size=64)                      # draw AFTER the step
