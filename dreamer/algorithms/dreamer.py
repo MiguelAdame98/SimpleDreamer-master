@@ -102,7 +102,7 @@ class Dreamer:
         if len(self.buffer) < 1:
             self.environment_interaction(env, self.config.seed_episodes)
 
-        ckpt_every = 50                       # iterations
+        ckpt_every = 5                       # iterations
         ckpt_dir   = self.run_dir / "ckpt"
         if ckpt_dir and not ckpt_dir.exists():
             ckpt_dir.mkdir(parents=True)
@@ -141,7 +141,6 @@ class Dreamer:
             if it % ckpt_every == 0:
                 self._save_ckpt(it)
 
-    @staticmethod
     def _modules(self):
         # everything we want to store
         return dict(
