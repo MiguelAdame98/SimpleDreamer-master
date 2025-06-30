@@ -292,6 +292,7 @@ class Dreamer:
                 front_cell = env.grid.get(*front_pos)
 
                 if steps < SAFE_STEPS:
+                    
                     if isinstance(front_cell, Wall):
                         # there's a wall ahead → turn
                         env_act = random.choice([0, 1])  # 0=left, 1=right
@@ -299,7 +300,7 @@ class Dreamer:
                         env_act = 2                      # 2=forward
                 else:
                     # after SAFE_STEPS, pure random
-                    env_act = random.randrange(0,2)
+                    env_act = random.randrange(0,3)
                 buffer_act = np.array(env_act, dtype=np.int32)
 
                 next_obs, reward, done, _ = env.step(env_act)
