@@ -1,43 +1,21 @@
-import os
-
+import os, argparse
 os.environ["MUJOCO_GL"] = "egl"
-
-import argparse
+from pathlib import Path          #  ←  add this import
 from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
-
+import shutil
 from dreamer.algorithms.dreamer import Dreamer
 from dreamer.algorithms.plan2explore import Plan2Explore
-from dreamer.utils.utils import load_config, get_base_directory
-from dreamer.envs.envs import make_dmc_env, make_atari_env, get_env_infos
+from dreamer.utils.utils import load_config, get_base_directory, new_run_dir
+
+# ⬇️  NEW: include make_minigrid_env
+from dreamer.envs.envs import (
+    make_atari_env, make_minigrid_env, get_env_infos
+)
 
 
 def main(config_file):
     config = load_config(config_file)
-
-    if config.environment.benchmark == "atari":
-        env = make_atari_env(
-            task_name=config.environment.task_name,
-            seed=config.environment.seed,
-            height=config.environment.height,
-            width=config.environment.width,
-            skip_frame=config.environment.frame_skip,
-            pixel_norm=config.environment.pixel_norm,
-        )
-    elif config.environment.benchmark == "dmc":
-        env = make_dmc_env(
-            domain_name=config.environment.domain_name,
-            task_name=config.environment.task_name,
-            seed=config.environment.seed,
-            visualize_reward=config.environment.visualize_reward,
-            from_pixels=config.environment.from_pixels,
-            height=config.environment.height,
-            width=config.environment.width,
-            frame_skip=config.environment.frame_skip,
-            pixel_norm=config.environment.pixel_norm,
-        )
-    obs_shape, discrete_action_bool, action_size = get_env_infos(env)
-
     log_dir = (
         get_base_directory()
         + "/runs/"
@@ -45,12 +23,29 @@ def main(config_file):
         + "_"
         + config.operation.log_dir
     )
-    writer = SummaryWriter(log_dir)
+    run_dir = new_run_dir(exp_name="mg_collision")
+    shutil.copy(config_file, run_dir / "config.yml")   # save exact cfg
+    writer   = SummaryWriter(run_dir)
     device = config.operation.device
 
+    if config.environment.benchmark == "minigrid":          # ⬅️ NEW
+        env = make_minigrid_env(
+            task_name   = config.environment.task_name,
+            rooms_row   = config.environment.rooms_row,
+            rooms_col   = config.environment.rooms_col,
+            frame_skip  = config.environment.frame_skip,
+            pixel_norm  = config.environment.pixel_norm,
+            run_dir=run_dir
+
+        )
+    else:
+        raise ValueError(f"Unknown benchmark: {config.environment.benchmark}")
+    obs_shape, discrete_action_bool, action_size = get_env_infos(env)
+
+    
     if config.algorithm == "dreamer-v1":
         agent = Dreamer(
-            obs_shape, discrete_action_bool, action_size, writer, device, config
+            obs_shape, discrete_action_bool, action_size, writer, device, config,run_dir
         )
     elif config.algorithm == "plan2explore":
         agent = Plan2Explore(
@@ -59,12 +54,13 @@ def main(config_file):
     agent.train(env)
 
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config",
         type=str,
-        default="dmc-walker-walk.yml",
-        help="config file to run(default: dmc-walker-walk.yml)",
+        default="configs/minigrid-default.yml",
+        help="Path to the YAML config file",
     )
     main(parser.parse_args().config)

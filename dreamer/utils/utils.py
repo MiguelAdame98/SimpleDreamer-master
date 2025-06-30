@@ -7,13 +7,20 @@ def attrdict_monkeypatch_fix():
 attrdict_monkeypatch_fix()
 
 import os
-
+import os, datetime, pathlib, yaml, shutil
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import yaml
 from attrdict import AttrDict
+
+def new_run_dir(base="./runs", exp_name="minigrid"):
+    ts   = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = pathlib.Path(base) / exp_name / ts
+    path.mkdir(parents=True, exist_ok=False)
+    (path / "ckpt").mkdir()
+    return path
 
 def horizontal_forward(network, x, y=None, input_shape=(-1,), output_shape=(-1,)):
     batch_with_horizon_shape = x.shape[: -len(input_shape)]
@@ -126,17 +133,26 @@ class DynamicInfos:
         self.data = {}
 
 
-def find_file(file_name):
+def find_file(file_name: str) -> str:
+    """
+    Walk downward from the current working directory until we find *file_name*.
+
+    If *file_name* contains path components (e.g. 'configs/foo.yml') we ignore
+    them and match only the basename, so either of the following now works:
+
+        find_file('configs/minigrid-default.yml')
+        find_file('minigrid-default.yml')
+    """
     cur_dir = os.getcwd()
+    base_name = os.path.basename(file_name)   # <-- strip any leading path
 
     for root, dirs, files in os.walk(cur_dir):
-        if file_name in files:
-            return os.path.join(root, file_name)
+        if base_name in files:                # compare with the stripped name
+            return os.path.join(root, base_name)
 
     raise FileNotFoundError(
         f"File '{file_name}' not found in subdirectories of {cur_dir}"
     )
-
 
 def get_base_directory():
     return "/".join(find_file("main.py").split("/")[:-1])

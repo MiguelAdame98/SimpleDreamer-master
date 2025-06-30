@@ -1,221 +1,332 @@
+# dreamer/algorithms/dreamer.py
+import logging, time, math, os
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 
-from dreamer.modules.model import RSSM, RewardModel, ContinueModel
+from dreamer.modules.model   import RSSM, RewardModel, ContinueModel
 from dreamer.modules.encoder import Encoder
 from dreamer.modules.decoder import Decoder
-
-from dreamer.utils.utils import (
-    compute_lambda_values,
-    create_normal_dist,
-    DynamicInfos,
+from dreamer.utils.utils     import (
+    compute_lambda_values, create_normal_dist, DynamicInfos
 )
-from dreamer.utils.buffer import ReplayBuffer
+from dreamer.utils.buffer    import ReplayBuffer
+from pathlib import Path
+import random
+import gym_minigrid
+from gym_minigrid.minigrid import Wall
+# --------------------------------------------------------------------------- #
+#  nice-looking logger                                                        #
+# --------------------------------------------------------------------------- #
+log = logging.getLogger("Dreamer")
+if not log.handlers:          # only configure once
+    h  = logging.StreamHandler()
+    fmt = "[%(name)s] %(message)s"
+    h.setFormatter(logging.Formatter(fmt))
+    log.addHandler(h)
+log.setLevel(os.environ.get("DREAMER_LOG_LVL", "INFO").upper())
 
 
+# --------------------------------------------------------------------------- #
+#                           D R E A M E R                                     #
+# --------------------------------------------------------------------------- #
 class Dreamer:
-    def __init__(
-        self,
-        observation_shape,
-        discrete_action_bool,
-        action_size,
-        writer,
-        device,
-        config,
-    ):
-        self.device = device
-        self.action_size = action_size
+    # ..................................................................... #
+    def __init__(self,
+                 observation_shape,
+                 discrete_action_bool,
+                 action_size,
+                 writer,
+                 device,
+                 config,
+                 run_dir):
+        t0 = time.time()
+        self.run_dir=Path(run_dir) if run_dir else None
+        self.device               = device
+        self.action_size          = action_size
         self.discrete_action_bool = discrete_action_bool
+        self.writer               = writer
+        self.num_total_episode    = 0
+        self.global_step = 0
+        self.config               = config.parameters.dreamer
 
-        self.encoder = Encoder(observation_shape, config).to(self.device)
-        self.decoder = Decoder(observation_shape, config).to(self.device)
-        self.rssm = RSSM(action_size, config).to(self.device)
-        if config.parameters.dreamer.use_continue_flag:
-            self.continue_predictor = ContinueModel(config).to(self.device)
-        
-        self.buffer = ReplayBuffer(observation_shape, action_size, self.device, config)
+        # ---------- networks --------------------------------------------- #
+        self.encoder           = Encoder(observation_shape, config).to(device)
+        self.decoder           = Decoder(observation_shape, config).to(device)
+        self.rssm              = RSSM(action_size, config).to(device)
+        self.reward_predictor  = RewardModel(config).to(device)
 
-        self.config = config.parameters.dreamer
+        if self.config.use_continue_flag:
+            self.continue_predictor = ContinueModel(config).to(device)
 
-        # optimizer
-        self.model_params = (
-            list(self.encoder.parameters())
-            + list(self.decoder.parameters())
-            + list(self.rssm.parameters())
-            + list(self.reward_predictor.parameters())
-        )
+        # ---------- replay buffer ---------------------------------------- #
+        self.buffer = ReplayBuffer(observation_shape,
+                                   action_size,
+                                   device,
+                                   config)
+
+        # ---------- optimiser ------------------------------------------- #
+        self.model_params = (list(self.encoder.parameters())   +
+                             list(self.decoder.parameters())   +
+                             list(self.rssm.parameters())      +
+                             list(self.reward_predictor.parameters()))
         if self.config.use_continue_flag:
             self.model_params += list(self.continue_predictor.parameters())
 
         self.model_optimizer = torch.optim.Adam(
             self.model_params, lr=self.config.model_learning_rate
         )
-    
         self.continue_criterion = nn.BCELoss()
 
-        self.dynamic_learning_infos = DynamicInfos(self.device)
-        self.behavior_learning_infos = DynamicInfos(self.device)
+        # ---------- helpers --------------------------------------------- #
+        self.dynamic_learning_infos  = DynamicInfos(device)
+        self.behavior_learning_infos = DynamicInfos(device)  # not used yet
 
-        self.writer = writer
-        self.num_total_episode = 0
+        # ---------- debug summary ---------------------------------------- #
+        def n_params(m): return sum(p.numel() for p in m.parameters())/1e6
+        log.info("Initialised Dreamer | encoder %.1f M  rssm %.1f M  total %.1f M",
+                 n_params(self.encoder), n_params(self.rssm),
+                 sum(p.numel() for p in self.model_params)/1e6)
+        log.info("device: %s | buffer capacity: %s",
+                 device, f"{self.buffer.capacity:,}")
+        log.info("setup done in %.2f s", time.time()-t0)
 
+    # ..................................................................... #
+    # placeholder until you plug actor-critic
+    def behavior_learning(self, *_):
+        return
+
+    # ..................................................................... #
     def train(self, env):
+        # seed episodes --------------------------------------------------- #
         if len(self.buffer) < 1:
             self.environment_interaction(env, self.config.seed_episodes)
 
-        for iteration in range(self.config.train_iterations):
-            for collect_interval in range(self.config.collect_interval):
+        ckpt_every = 50                       # iterations
+        ckpt_dir   = self.run_dir / "ckpt"
+        if ckpt_dir and not ckpt_dir.exists():
+            ckpt_dir.mkdir(parents=True)
+
+        # resume if a *.pt file already exists ----------------------------------
+        latest = sorted(ckpt_dir.glob("iter*.pt"))[-1] if list(ckpt_dir.glob("iter*.pt")) else None
+        if latest:
+            self._load_ckpt(latest)
+            print(f"[Dreamer] resumed from {latest.name}")
+
+
+        # main loop ------------------------------------------------------- #
+        for it in range(1, self.config.train_iterations + 1):
+            log.info("⇢ iteration %d/%d", it, self.config.train_iterations)
+
+            # --- model training cycles ---------------------------------- #
+            for c in range(1, self.config.collect_interval + 1):
                 data = self.buffer.sample(
                     self.config.batch_size, self.config.batch_length
                 )
-                posteriors, deterministics = self.dynamic_learning(data)
-                self.behavior_learning(posteriors, deterministics)
+                post, det = self.dynamic_learning(data)
+                self.behavior_learning(post, det)
 
-            self.environment_interaction(env, self.config.num_interaction_episodes)
-            self.evaluate(env)
+                if c % 10 == 0:
+                    log.debug("   collect %d/%d  buffer len: %d",
+                              c, self.config.collect_interval, len(self.buffer))
 
+            # --- interact with env -------------------------------------- #
+            self.environment_interaction(env,
+                                         self.config.num_interaction_episodes)
+            
+
+            # --- evaluation --------------------------------------------- #
+            if it % 10 == 0:
+                self.evaluate(env)
+            if it % ckpt_every == 0:
+                self._save_ckpt(it)
+
+    @staticmethod
+    def _modules(self):
+        # everything we want to store
+        return dict(
+            encoder=self.encoder,
+            decoder=self.decoder,
+            rssm=self.rssm,
+            reward=self.reward_predictor
+        )
+
+    def _save_ckpt(self, it):
+        state = {
+            "iter" : it,
+            "rng"  : torch.random.get_rng_state(),
+            "opt"  : {k: o.state_dict() for k, o in {
+                        "model": self.model_optimizer,
+                        "actor": getattr(self, "actor_optimizer", None),
+                        "critic":getattr(self,"critic_optimizer",None)}
+                    .items() if o},
+            "modules": {n: m.state_dict() for n, m in self._modules().items()},
+        }
+        path = self.run_dir / "ckpt" / f"iter{it:05d}.pt"
+        torch.save(state, path)
+        print(f"[ckpt] saved → {path.name}")
+
+    def _load_ckpt(self, path):
+        ckpt = torch.load(path, map_location=self.device)
+        for n, m in self._modules().items():
+            m.load_state_dict(ckpt["modules"][n])
+        for n, o in {"model": self.model_optimizer,
+                    "actor": getattr(self, "actor_optimizer", None),
+                    "critic":getattr(self,"critic_optimizer", None)}.items():
+            if o and n in ckpt["opt"]:
+                o.load_state_dict(ckpt["opt"][n])
+        torch.random.set_rng_state(ckpt["rng"])
+        self.start_iter = ckpt.get("iter", 0) + 1
+    # ..................................................................... #
     def evaluate(self, env):
-        self.environment_interaction(env, self.config.num_evaluate, train=False)
+        self.environment_interaction(env,
+                                     self.config.num_evaluate,
+                                     train=False)
 
+    # ..................................................................... #
     def dynamic_learning(self, data):
-        prior, deterministic = self.rssm.recurrent_model_input_init(len(data.action))
-
+        # roll out through time ------------------------------------------ #
+        prior, det = self.rssm.recurrent_model_input_init(len(data.action))
         data.embedded_observation = self.encoder(data.observation)
 
         for t in range(1, self.config.batch_length):
-            deterministic = self.rssm.recurrent_model(
-                prior, data.action[:, t - 1], deterministic
-            )
-            prior_dist, prior = self.rssm.transition_model(deterministic)
-            posterior_dist, posterior = self.rssm.representation_model(
-                data.embedded_observation[:, t], deterministic
-            )
+            det = self.rssm.recurrent_model(prior, data.action[:, t-1], det)
+            prior_dist, prior = self.rssm.transition_model(det)
+            post_dist, post   = self.rssm.representation_model(
+                                    data.embedded_observation[:, t], det)
 
             self.dynamic_learning_infos.append(
-                priors=prior,
-                prior_dist_means=prior_dist.mean,
-                prior_dist_stds=prior_dist.scale,
-                posteriors=posterior,
-                posterior_dist_means=posterior_dist.mean,
-                posterior_dist_stds=posterior_dist.scale,
-                deterministics=deterministic,
+                priors                = prior,
+                prior_dist_means      = prior_dist.mean,
+                prior_dist_stds       = prior_dist.scale,
+                posteriors            = post,
+                posterior_dist_means  = post_dist.mean,
+                posterior_dist_stds   = post_dist.scale,
+                deterministics        = det,
             )
-
-            prior = posterior
+            prior = post
 
         infos = self.dynamic_learning_infos.get_stacked()
-        self._model_update(data, infos)
+        losses = self._model_update(data, infos)
+
+        log.debug("   dynamic-loss: %.4f  (KL %.3f ‖ recon %.3f ‖ rew %.3f)",
+                  losses["model"], losses["kl"], losses["recon"], losses["rew"])
         return infos.posteriors.detach(), infos.deterministics.detach()
 
-    def _model_update(self, data, posterior_info):
-        reconstructed_observation_dist = self.decoder(
-            posterior_info.posteriors, posterior_info.deterministics
-        )
-        reconstruction_observation_loss = reconstructed_observation_dist.log_prob(
-            data.observation[:, 1:]
-        )
+    # ..................................................................... #
+    def _model_update(self, data, infos):
+        # ───────────────────────── reconstruction (image log-likelihood) ──────
+        recon_dist  = self.decoder(infos.posteriors, infos.deterministics)
+        recon_loss  = recon_dist.log_prob(data.observation[:, 1:])          # <── moved up
+
+        # ───────────────────────── continue flag (optional) ───────────────────
         if self.config.use_continue_flag:
-            continue_dist = self.continue_predictor(
-                posterior_info.posteriors, posterior_info.deterministics
-            )
-            continue_loss = self.continue_criterion(
-                continue_dist.probs, 1 - data.done[:, 1:]
-            )
+            cont_dist = self.continue_predictor(infos.posteriors,
+                                                infos.deterministics)
+            cont_loss = self.continue_criterion(cont_dist.probs,
+                                                1 - data.done[:, 1:])
 
-        reward_dist = self.reward_predictor(
-            posterior_info.posteriors, posterior_info.deterministics
-        )
-        reward_loss = reward_dist.log_prob(data.reward[:, 1:])
+        # ───────────────────────── reward model  ───────────────────────────────
+        rew_dist  = self.reward_predictor(infos.posteriors, infos.deterministics)
+        rew_loss  = rew_dist.log_prob(data.reward[:, 1:])
 
-        prior_dist = create_normal_dist(
-            posterior_info.prior_dist_means,
-            posterior_info.prior_dist_stds,
-            event_shape=1,
-        )
-        posterior_dist = create_normal_dist(
-            posterior_info.posterior_dist_means,
-            posterior_info.posterior_dist_stds,
-            event_shape=1,
-        )
-        kl_divergence_loss = torch.mean(
-            torch.distributions.kl.kl_divergence(posterior_dist, prior_dist)
-        )
-        kl_divergence_loss = torch.max(
-            torch.tensor(self.config.free_nats).to(self.device), kl_divergence_loss
-        )
-        model_loss = (
-            self.config.kl_divergence_scale * kl_divergence_loss
-            - reconstruction_observation_loss.mean()
-            - reward_loss.mean()
-        )
+        # ───────────────────────── KL divergence  ──────────────────────────────
+        prior_dist = create_normal_dist(infos.prior_dist_means,
+                                        infos.prior_dist_stds, event_shape=1)
+        post_dist  = create_normal_dist(infos.posterior_dist_means,
+                                        infos.posterior_dist_stds, event_shape=1)
+
+        kl = torch.distributions.kl.kl_divergence(post_dist, prior_dist).mean()
+        kl = torch.max(torch.tensor(self.config.free_nats, device=self.device), kl)
+
+        # ───────────────────────── total model loss  ───────────────────────────
+        model_loss = ( self.config.kl_divergence_scale * kl
+                    - recon_loss.mean()
+                    - rew_loss.mean() )
         if self.config.use_continue_flag:
-            model_loss += continue_loss.mean()
+            model_loss += cont_loss.mean()
 
+        # ───────────────────────── optimisation  ───────────────────────────────
         self.model_optimizer.zero_grad()
         model_loss.backward()
-        nn.utils.clip_grad_norm_(
-            self.model_params,
-            self.config.clip_grad,
-            norm_type=self.config.grad_norm_type,
-        )
+        nn.utils.clip_grad_norm_(self.model_params,
+                                self.config.clip_grad,
+                                norm_type=self.config.grad_norm_type)
         self.model_optimizer.step()
 
-    
+        # ───────────────────────── bookkeeping / logging  ──────────────────────
+        self.global_step += 1
+        if self.writer is not None and self.global_step % 20 == 0:
+            recon_img = recon_dist.mean[0, -1].clamp(0, 1)  # (3,H,W)
+            self.writer.add_image("reconstruction", recon_img, self.global_step)
 
+        return dict(model=model_loss.item(),
+                    kl=kl.item(),
+                    recon=-recon_loss.mean().item(),
+                    rew=-rew_loss.mean().item())
+
+    # ..................................................................... #
     @torch.no_grad()
-    def environment_interaction(self, env, num_interaction_episodes, train=True):
-        for epi in range(num_interaction_episodes):
-            posterior, deterministic = self.rssm.recurrent_model_input_init(1)
-            action = torch.zeros(1, self.action_size).to(self.device)
+    def environment_interaction(self, env,
+                                num_episodes,
+                                train: bool = True):
 
-            observation = env.reset()
-            embedded_observation = self.encoder(
-                torch.from_numpy(observation).float().to(self.device)
-            )
+        mode = "train" if train else "eval"
+        for epi in range(num_episodes):
+            posterior, det = self.rssm.recurrent_model_input_init(1)
+            action  = torch.zeros(1, self.action_size, device=self.device)
 
-            score = 0
-            score_lst = np.array([])
+            obs     = env.reset()
+            emb_obs = self.encoder(torch.tensor(obs, dtype=torch.float32,
+                                                device=self.device))
+
+            score, steps = 0.0, 0
             done = False
-
+            SAFE_STEPS = 50
             while not done:
-                deterministic = self.rssm.recurrent_model(
-                    posterior, action, deterministic
-                )
-                embedded_observation = embedded_observation.reshape(1, -1)
-                _, posterior = self.rssm.representation_model(
-                    embedded_observation, deterministic
-                )
-                action = self.actor(posterior, deterministic).detach()
+                det = self.rssm.recurrent_model(posterior, action, det)
+                emb_obs = emb_obs.reshape(1, -1)
+                _, posterior = self.rssm.representation_model(emb_obs, det)
 
-                if self.discrete_action_bool:
-                    buffer_action = action.cpu().numpy()
-                    env_action = buffer_action.argmax()
 
-                else:
-                    buffer_action = action.cpu().numpy()[0]
-                    env_action = buffer_action
+                front_pos = env.front_pos           # (x, y) tuple
+                front_cell = env.grid.get(*front_pos)
 
-                next_observation, reward, done, info = env.step(env_action)
-                if train:
-                    self.buffer.add(
-                        observation, buffer_action, reward, next_observation, done
-                    )
-                score += reward
-                embedded_observation = self.encoder(
-                    torch.from_numpy(next_observation).float().to(self.device)
-                )
-                observation = next_observation
-                if done:
-                    if train:
-                        self.num_total_episode += 1
-                        self.writer.add_scalar(
-                            "training score", score, self.num_total_episode
-                        )
+                if steps < SAFE_STEPS:
+                    if isinstance(front_cell, Wall):
+                        # there's a wall ahead → turn
+                        env_act = random.choice([0, 1])  # 0=left, 1=right
                     else:
-                        score_lst = np.append(score_lst, score)
-                    break
+                        env_act = 2                      # 2=forward
+                else:
+                    # after SAFE_STEPS, pure random
+                    env_act = random.randrange(0,2)
+                buffer_act = np.array(env_act, dtype=np.int32)
+
+                next_obs, reward, done, _ = env.step(env_act)
+
+                if train:
+                    self.buffer.add(obs, buffer_act, reward, next_obs, done)
+
+                score  += reward
+                steps  += 1
+                emb_obs = self.encoder(torch.tensor(next_obs, dtype=torch.float32,
+                                                    device=self.device))
+                obs     = next_obs
+
+            # ---------- episode finished -------------------------------- #
+            if train:
+                self.num_total_episode += 1
+                self.writer.add_scalar("training score", score,
+                                       self.num_total_episode)
+
+            log.info("  episode %d (%s)  score: %.2f  steps: %d",
+                     self.num_total_episode if train else epi+1,
+                     mode, score, steps)
+
+        # ---------- evaluation summary ---------------------------------- #
         if not train:
-            evaluate_score = score_lst.mean()
-            print("evaluate score : ", evaluate_score)
-            self.writer.add_scalar("test score", evaluate_score, self.num_total_episode)
+            self.writer.add_scalar("test score", score, self.num_total_episode)
+            log.info("≈ evaluate mean-score: %.3f over %d episodes",
+                     score / num_episodes, num_episodes)
+
