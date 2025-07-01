@@ -105,7 +105,7 @@ def make_minigrid_env(
         if os.getenv("DREAMER_RENDER") == "1":
             out_dir = (run_dir or Path.cwd() / "videos") / "videos"
             out_dir.mkdir(parents=True, exist_ok=True)
-            env = VideoEveryN(env, out_dir=out_dir, every=200)    
+            env = VideoEveryN(env, out_dir=out_dir, every=500)    
             env._video_prefix = task_name.replace("MiniGrid-", "")
             # --- generic Dreamer wrappers --------------------------------------
         if pixel_norm:
@@ -143,7 +143,7 @@ class VideoEveryN(gym.Wrapper):
     Records an MP4 of every *N*-th episode by calling env.render("rgb_array").
     Works with **any** Gym version.
     """
-    def __init__(self, env, out_dir, every=200, prefix="episode"):
+    def __init__(self, env, out_dir, every=500, prefix="episode"):
         super().__init__(env)
         self.every      = every
         self.ep_counter = 0
