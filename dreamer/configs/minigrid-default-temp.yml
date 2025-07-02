@@ -1,5 +1,3 @@
-#minigrid-default
-# ───────────────────────────────  TOP LEVEL  ────────────────────────────────
 algorithm: dreamer-v1
 
 # ────────────────────────────────  RUNTIME  ────────────────────────────────
@@ -30,24 +28,26 @@ parameters:
     batch_length:              30
     collect_interval:          100
     num_interaction_episodes:  1
-    seed_episodes:             50
+    seed_episodes:             2000
     num_evaluate:              3
 
     # objective -------------------------------------------------------------
     kl_divergence_scale:       1
-    free_nats:                 1
+    free_nats:                 3
     discount:                  0.99
     lambda_:                   0.95
 
     # optimisation ----------------------------------------------------------
     use_continue_flag:         false
+    actor_learning_rate:       4.0e-5
+    critic_learning_rate:      1.0e-4
     model_learning_rate:       2.0e-4
     grad_norm_type:            2
     clip_grad:                 100
 
     # model sizes -----------------------------------------------------------
-    deterministic_size:        400
-    stochastic_size:           64
+    deterministic_size:        200
+    stochastic_size:           34
     embedded_state_size:   1024
 
     buffer:
@@ -88,5 +88,21 @@ parameters:
       num_layers:  2
       activation:  ELU
 
+    continue_:
+      hidden_size: 400
+      num_layers:  3
+      activation:  ELU
 
-  
+    agent:
+      actor:
+        hidden_size: 400
+        min_std:     1.0e-4
+        init_std:    5.0
+        mean_scale:  5.0
+        activation:  ELU
+        num_layers:  2
+
+      critic:
+        hidden_size: 400
+        activation:  ELU
+        num_layers:  3

@@ -8,6 +8,8 @@ env = gym.make(
     rooms_in_row=3,
     rooms_in_col=4
 )
+print(env.action_space)
+print(env.action_space)
 
 obs = env.reset()
 done = False

@@ -2,6 +2,7 @@ import gym
 import numpy as np
 import os
 from pathlib import Path
+from gym import spaces
 
 # --------------------------------------------------------------------------
 # Make sure we have a ResizeObservation wrapper even on old Gym versions
@@ -95,13 +96,13 @@ def make_minigrid_env(
             rooms_in_col=rooms_col
         )
         # (7×7×3) → (56×56×3) is already done by your custom wrappers inside
+        env = ThreeActionWrapper(env)
         env = RGBImgPartialObsWrapper(env)   # adds "image" key
         env = ImgObsWrapper(env)             # drop everything except image
 
         env = gym.wrappers.ResizeObservation(env, (height, width))      # 64×64×3
         env = ChannelFirstEnv(env)                                     # 3×64×64
-        env = SkipFrame(env, frame_skip)
-        env = EpisodicStats(env)
+
         if os.getenv("DREAMER_RENDER") == "1":
             out_dir = (run_dir or Path.cwd() / "videos") / "videos"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -113,8 +114,29 @@ def make_minigrid_env(
 
         env.seed(1337)
         return env
+class ThreeActionWrapper(gym.core.ActionWrapper):
+    """
+    Strip MiniGrid’s 7-action A PI down to LEFT / RIGHT / FORWARD.
+    Incoming action ∈ {0,1,2}.  We just forward it unchanged.
+    """
+    def __init__(self, env):
+        super().__init__(env)
+        # overwrite the public action_space so that agents & Dreamer
+        # know they can only output 3 discrete values
+        self.action_space = spaces.Discrete(3)
 
-class EpisodicStats(gym.Wrapper):
+    # ---- mapping new-space → original-space ---------------------------
+    def action(self, act):
+        # act is already int{0,1,2}.  In MiniGrid’s native space
+        # left=0  right=1  forward=2, so we just pass it through.
+        return int(act)
+
+    # ---- mapping original-space → new-space (needed for .render() etc.)
+    def reverse_action(self, act):
+        # called by wrappers that may need to show keyboard hints, etc.
+        # We only ever generate 0-2, so this is also identity.
+        return int(act)
+'''class EpisodicStats(gym.Wrapper):
     """
     Adds `info["episodic_return"]` and `info["episodic_length"]`
     on the final `step()` of every episode.
@@ -135,7 +157,7 @@ class EpisodicStats(gym.Wrapper):
         if done:
             info["episodic_return"]  = self._R
             info["episodic_length"]  = self._L
-        return obs, rew, done, info
+        return obs, rew, done, info'''
 import imageio, numpy as np, datetime as dt, pathlib, gym
 
 class VideoEveryN(gym.Wrapper):

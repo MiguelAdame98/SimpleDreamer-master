@@ -41,6 +41,7 @@ def main(config_file):
     else:
         raise ValueError(f"Unknown benchmark: {config.environment.benchmark}")
     obs_shape, discrete_action_bool, action_size = get_env_infos(env)
+    print(env.action_space)
 
     
     if config.algorithm == "dreamer-v1":
