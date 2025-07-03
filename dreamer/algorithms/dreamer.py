@@ -3,6 +3,7 @@ import logging, time, math, os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torchvision.utils import save_image
 
 from dreamer.modules.model   import RSSM, RewardModel, ContinueModel
@@ -46,6 +47,9 @@ class Dreamer:
         self.run_dir=Path(run_dir) if run_dir else None
         self.device               = device
         self.action_size          = action_size
+        self.action_dict = {"left": 0,
+                            "right": 1,
+                            "forward": 2}
         self.discrete_action_bool = discrete_action_bool
         self.writer               = writer
         self.log_dir = Path(run_dir)
@@ -268,28 +272,52 @@ class Dreamer:
 
         # ─── tiny visual probe every 200 optimisation steps  ---------------
         # save to  runs/<TIMESTAMP>/recon/recon_00012.png  (auto-created dir)
+        self._vis_counter = getattr(self, "_vis_counter", 0)
         if getattr(self, "_vis_counter", 0) % 50 == 0:
+           
+            with torch.no_grad():                       # ← important: no grads!
+                outdir = Path(self.run_dir) / "recon"
+                outdir.mkdir(parents=True, exist_ok=True)
 
+                # --- 1. ground truth & reconstruction at t = 1 ------------------
+                t0_img = data.observation[0, 1]          # (3,64,64)   gt
+                recon   = recon_dist.mean[0, 0]          # posterior-recon of the same
 
-            # one random sample from the current mini-batch
-            t0_img  = data.observation[0, 1]               # (3,64,64) ground truth @ t=1
-            recon   = recon_dist.mean[0, 0]                # (3,64,64) posterior @ t=1
-            # choose a prior *one* step farther than the last real frame
-            prior_d = infos.deterministics[0, -1]          # (H)  deterministic  @ t = last
-            prior_z = infos.priors       [0, -1]           # (Z)  prior latent   @ t = last
-            fantas  = self.decoder(prior_z[None],          # (1,Z)
-                                prior_d[None]           # (1,H)
-                                ).mean.squeeze(0)        # → (3,64,64)
-            grid = torch.stack([t0_img.cpu(),
-                                recon  .cpu(),
-                                fantas .cpu()])             # 3×3×64×64 – OK
-            out  = Path(self.run_dir) / "recon"
-            out.mkdir(parents=True, exist_ok=True)
-            n    = len(list(out.glob("recon_*.png")))
-            save_image(grid, out / f"recon_{n:05d}.png",
-                    nrow=3, normalize=True)
+                # --- 2. one-step PRIOR (“fantasy”) ------------------------------
+                prior_d = infos.deterministics[0, -1]    # deterministic @ last step
+                prior_z = infos.priors       [0, -1]     # prior z (no obs)
 
-        self._vis_counter = getattr(self, "_vis_counter", 0) + 1
+                fantasy = self.decoder(prior_z[None],    # add batch dim (1, Z)
+                                        prior_d[None]    # (1, H)
+                                    ).mean.squeeze(0) # → (3,64,64)
+
+                # --- 3. 4-step dreamed rollout under a hand-picked cmd list -----
+                cmd = ["forward", "forward", "left", "forward"]
+                act_idx = torch.tensor([self.action_dict[a] for a in cmd],
+                                    device=self.device)
+                onehots = F.one_hot(act_idx, num_classes=self.action_size).float()  # (T,3)
+
+                z = prior_z.unsqueeze(0)     # (1,Z)
+                d = prior_d.unsqueeze(0)     # (1,H)
+                dreams = []
+                for a in onehots:
+                    a = a.unsqueeze(0)       # (1,3)
+                    d = self.rssm.recurrent_model(z, a, d)
+                    _, z = self.rssm.transition_model(d)  # PRIOR z_{t+1}
+                    frame = self.decoder(z, d).mean.squeeze(0).cpu()
+                    dreams.append(frame)
+
+                # --- save both grids (truth|recon|prior  & dreams) ---------------
+                grid1 = torch.stack([t0_img.cpu(), recon.cpu(), fantasy.cpu()])
+                save_image(grid1, outdir / f"recon_{self._vis_counter//50:05d}.png",
+                        nrow=3, normalize=True)
+
+                grid2 = torch.stack([t0_img.cpu()] + dreams)  # 1+len(cmd) frames
+                save_image(grid2, outdir / f"dream_{self._vis_counter//50:05d}.png",
+                        nrow=len(cmd)+1, normalize=True)
+
+        self._vis_counter += 1
+        
         if self.writer is not None :
             step = self._vis_counter                     # same counter as above
             self.writer.add_scalar("loss/model" ,  model_loss.item(), step)
@@ -319,7 +347,7 @@ class Dreamer:
 
             score, steps = 0.0, 0
             done = False
-            SAFE_STEPS = 50
+            SAFE_STEPS = 30
             while not done:
                 det = self.rssm.recurrent_model(posterior, action, det)
                 emb_obs = emb_obs.reshape(1, -1)

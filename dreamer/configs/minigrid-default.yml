@@ -30,7 +30,7 @@ parameters:
     batch_length:              30
     collect_interval:          100
     num_interaction_episodes:  1
-    seed_episodes:             50
+    seed_episodes:             5
     num_evaluate:              3
 
     # objective -------------------------------------------------------------
@@ -46,8 +46,8 @@ parameters:
     clip_grad:                 100
 
     # model sizes -----------------------------------------------------------
-    deterministic_size:        400
-    stochastic_size:           64
+    deterministic_size:        600
+    stochastic_size:           600
     embedded_state_size:   1024
 
     buffer:
