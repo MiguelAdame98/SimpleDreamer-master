@@ -273,7 +273,7 @@ class Dreamer:
         # ─── tiny visual probe every 200 optimisation steps  ---------------
         # save to  runs/<TIMESTAMP>/recon/recon_00012.png  (auto-created dir)
         self._vis_counter = getattr(self, "_vis_counter", 0)
-        if getattr(self, "_vis_counter", 0) % 50 == 0:
+        if getattr(self, "_vis_counter", 0) % 250 == 0:
            
             with torch.no_grad():                       # ← important: no grads!
                 outdir = Path(self.run_dir) / "recon"

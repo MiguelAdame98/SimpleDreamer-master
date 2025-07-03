@@ -30,7 +30,7 @@ parameters:
     batch_length:              30
     collect_interval:          100
     num_interaction_episodes:  1
-    seed_episodes:             5
+    seed_episodes:             100
     num_evaluate:              3
 
     # objective -------------------------------------------------------------
