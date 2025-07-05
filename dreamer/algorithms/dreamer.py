@@ -12,6 +12,7 @@ from dreamer.modules.decoder import Decoder
 from dreamer.utils.utils     import (
     compute_lambda_values, create_normal_dist, DynamicInfos
 )
+from dreamer.modules.actor import Actor
 from dreamer.utils.buffer    import ReplayBuffer
 from pathlib import Path
 import random
@@ -62,7 +63,8 @@ class Dreamer:
         self.decoder           = Decoder(observation_shape, config).to(device)
         self.rssm              = RSSM(action_size, config).to(device)
         self.reward_predictor  = RewardModel(config).to(device)
-
+        #self.actor = Actor( discrete_action_bool,action_size, config).to(device)
+        #self.debug_actor = True 
         if self.config.use_continue_flag:
             self.continue_predictor = ContinueModel(config).to(device)
 
@@ -347,6 +349,7 @@ class Dreamer:
 
             score, steps = 0.0, 0
             done = False
+            
             SAFE_STEPS = 30
             while not done:
                 det = self.rssm.recurrent_model(posterior, action, det)
@@ -356,6 +359,8 @@ class Dreamer:
 
                 front_pos = env.front_pos           # (x, y) tuple
                 front_cell = env.grid.get(*front_pos)
+                SAFE_STEPS = 30
+                # --------------------------------------------------------- choose an action
 
                 if steps < SAFE_STEPS:
                     
@@ -367,9 +372,12 @@ class Dreamer:
                 else:
                     # after SAFE_STEPS, pure random
                     env_act = random.randrange(0,3)
-                buffer_act = np.array(env_act, dtype=np.int32)
-
+              
+                buffer_act = np.eye(self.action_size, dtype=np.float32)[env_act]
+                print(buffer_act)
                 next_obs, reward, done, _ = env.step(env_act)
+                
+                
 
                 if train:
                     self.buffer.add(obs, buffer_act, reward, next_obs, done)
