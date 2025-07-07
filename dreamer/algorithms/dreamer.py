@@ -218,6 +218,30 @@ class Dreamer:
             )
             prior = post
 
+            if (self.global_step < 3) and (t == 1):          # only for first batches
+                b = 0                                         # look at batch element 0
+                # a) raw env action that goes into GRU
+                print(f"[dbg]  action[{b},{t-1}] =", data.action[b, t-1].cpu().numpy())
+
+                # b) latent statistics BEFORE representation model
+                print("[dbg]  prior mean±std",
+                    prior[b].mean().item(), prior[b].std().item())
+                print("[dbg]  det   mean±std",
+                    det  [b].mean().item(), det  [b].std().item())
+
+                # c) how different is posterior from prior at t?
+                diff = (post[b] - prior[b]).norm() / np.sqrt(post[b].numel())
+                print("[dbg]  ||posterior – prior||₂ per-dim ≈", diff.item())
+
+                # d) quick visual check – save recon vs. ground truth
+                import torchvision.utils as vutils, os
+                gt      = data.observation[b, t]              # (3,64,64)
+                recon_t = self.decoder(post[b:b+1], det[b:b+1]).mean.squeeze(0)
+                grid    = torch.stack([gt.cpu(), recon_t.cpu()])
+                os.makedirs("dbg", exist_ok=True)
+                vutils.save_image(grid, f"dbg/recon_g{self.global_step}_t{t}.png",
+                                nrow=2, normalize=True)
+
         infos = self.dynamic_learning_infos.get_stacked()
         losses = self._model_update(data, infos)
 
@@ -229,6 +253,20 @@ class Dreamer:
     def _model_update(self, data, infos):
         # ───────────────────────── reconstruction (image log-likelihood) ──────
         recon_dist  = self.decoder(infos.posteriors, infos.deterministics)
+        if (self.global_step < 3):
+            b = 0
+            # average PSNR of posterior reconstruction over the whole sequence
+            mse = ((recon_dist.mean[b] - data.observation[b,1:].to(self.device))**2).mean()
+            psnr = -10 * torch.log10(mse).item()
+            print(f"[dbg]  PSNR posterior recon (batch {b}) = {psnr:.1f} dB")
+
+            # prior reconstruction for the last time-step
+            prior_img = self.decoder(infos.priors[b:b+1,-1], infos.deterministics[b:b+1,-1]).mean
+            gt_img    = data.observation[b,-1]
+            mse = ((prior_img - gt_img.to(prior_img.device))**2).mean()
+            psnr = -10 * torch.log10(mse).item()
+            print(f"[dbg]  PSNR 1-step PRIOR (last step)  = {psnr:.1f} dB")
+
         recon_loss  = recon_dist.log_prob(data.observation[:, 1:])          # <── moved up
 
         # ───────────────────────── continue flag (optional) ───────────────────

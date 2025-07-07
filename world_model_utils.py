@@ -26,7 +26,7 @@ DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
 # ══════════════════════════════════════════════════════════════════════
 
 def load_world_model2(ckpt_path: str,
-                     config_yaml: str = "dreamer/configs/minigrid-default-temp.yml"):
+                     config_yaml: str = "/Users/lab25/hierarchical-nav/dreamer_mg/runs/mg_collision/20250704-220917/config.yml"):
     """
     Returns an object with .encoder and .rssm that exactly match *any*
     Dreamer checkpoint – no manual YAML tweaks required.
@@ -40,21 +40,20 @@ def load_world_model2(ckpt_path: str,
     import copy, yaml, torch
     ckpt = torch.load(ckpt_path, map_location=DEVICE)
 
-    # ---------- 1. discover sizes from weight shapes -------------------
-    Wrec = ckpt["modules"]["rssm"]["recurrent_model.linear.weight"]      # (H, in)
-    H, in_dim        = Wrec.shape
-    Wtrans = ckpt["modules"]["rssm"]["transition_model.network.2.weight"]# (2*Z, H)
-    stoch_sz         = Wtrans.shape[0] // 2
-    act_size         = in_dim - stoch_sz            # the checkpoint’s action space
+        # --- 1. discover sizes ------------------------------------------------
+    Wrec   = ckpt["modules"]["rssm"]["recurrent_model.linear.weight"]
+    H3, in_dim = Wrec.shape                 # (3H, input)
+    hidden = H3 // 3                        # true deterministic_size
+    Wtrans = ckpt["modules"]["rssm"]["transition_model.network.2.weight"]
+    stoch  = Wtrans.shape[0] // 2
+    act_size= in_dim - stoch
 
-    # ---------- 2. clone & patch the yaml ------------------------------
-    
-    cfg = yaml.safe_load(open(config_yaml))
-    cfg = copy.deepcopy(cfg)                         # keep original intact
-
-    cfg = AttrDict(cfg)  
-    cfg['parameters']['dreamer']['deterministic_size'] = H
-    cfg['parameters']['dreamer']['stochastic_size']    = stoch_sz
+    # --- 2. patch the yaml ------------------------------------------------
+    cfg = AttrDict(yaml.safe_load(open(config_yaml)))
+    cfg.parameters.dreamer.deterministic_size = hidden
+    cfg.parameters.dreamer.stochastic_size    = stoch
+    #cfg['parameters']['dreamer']['deterministic_size'] = H
+    #cfg['parameters']['dreamer']['stochastic_size']    = stoch_sz
 
     enc  = Encoder((3, 64, 64), cfg).to(DEVICE)
     dec = Decoder((3, 64, 64), cfg).to(DEVICE)
@@ -69,22 +68,23 @@ def load_world_model2(ckpt_path: str,
     wm.rssm    = rssm
     wm.decoder = dec
     wm.action_size = act_size                        # handy later
-    wm.idx = {                           #  ← canonical MiniGrid ids
-        "left":   0,
-        "right":  1,
-        "forward":2,
-        "pickup": 3,
-        "drop":   4,
-        "toggle": 5,
-        "done":   6,    }
+    if act_size == 3:                               # NEW model
+        wm.idx = {"left": 0, "right": 1, "forward": 2}
+    elif act_size == 7:                             # old checkpoints
+        wm.idx = {
+            "left":0,"right":1,"forward":2,
+            "pickup":3,"drop":4,"toggle":5,"done":6}
+    else:
+        raise ValueError(f"Unexpected action dim {act_size}")
     print("rssm expects action dim:", wm.action_size)
     return wm
-def onehot(action_name: str, wm):
+def onehot(a_name: str,wm):
+    if a_name not in wm.idx:
+        raise KeyError(f"action '{a_name}' not in mapping {wm.idx}")
     v = torch.zeros(wm.action_size, device=DEVICE)
-    idx = wm.idx.get(action_name, None)
-    if idx is not None:
-        v[idx] = 1.
+    v[wm.idx[a_name]] = 1.0
     return v
+
 # ══════════════════════════════════════════════════════════════════════
 # 2.  COLLISION PREDICTION  (wm_predict_collision)
 # ══════════════════════════════════════════════════════════════════════
@@ -110,23 +110,24 @@ def wm_update_belief(wm,
     """
     if prev_z_d is None:                               # first frame
         # dummy recurrent input (batch=1)
-        zprev, dprev = wm.rssm.recurrent_model_input_init(1)
+        prior, det = wm.rssm.recurrent_model_input_init(1)
     else:
-        zprev, dprev = prev_z_d
+        prior, det = prev_z_d
 
     # recurrent model if we have an *action that already happened*
-    if zprev is not None and prev_action_onehot is not None:
-        dprev = wm.rssm.recurrent_model(zprev,
-                                        prev_action_onehot.unsqueeze(0),  # (1,7)
-                                        dprev)
-
+    if prior is not None and prev_action_onehot is not None:
+        det = wm.rssm.recurrent_model(
+            prior,
+            prev_action_onehot.unsqueeze(0),  # (1, action_size)
+            det)
+    prior_dist, prior = wm.rssm.transition_model(det)
     # encode observation & run representation model
     img = torch.tensor(frame_rgb, dtype=torch.float32,
                        device=DEVICE).unsqueeze(0)
     emb = wm.encoder(img).view(1, -1)
-    _, zt = wm.rssm.representation_model(emb, dprev)   # posterior
+    _, post = wm.rssm.representation_model(emb, det)   # posterior 
 
-    return zt.detach(), dprev.detach()
+    return post.detach(), det.detach()
 
 
 @torch.no_grad()
@@ -219,6 +220,7 @@ def astar_prims(wm,
                 heapq.heappush(pq, (f2, g2, ns, new_seq))
 
     return []                                               # no safe path found
+
 import cv2, gym
 class DictResizeObs(gym.ObservationWrapper):
     def __init__(self, env, out_hw=(64,64)):
@@ -233,6 +235,72 @@ class DictResizeObs(gym.ObservationWrapper):
                          interpolation=cv2.INTER_AREA)
         obs["image"] = img
         return obs
+def update_belief_from_obs(obs_dict,belief_zd, prev_onehot):
+        
+    frame = obs_dict["image"].transpose(2,0,1) / 255.0   # ★ (3,64,64) float
+    return wm_update_belief(wm, belief_zd, frame, prev_onehot)
+def probe_decoder(wm, belief_zd, obs, action_plan, outdir="recon_demo"):
+    outdir = Path(outdir); outdir.mkdir(exist_ok=True)
+    # ---------- 1. current posterior ------------------------
+    rgb = obs["image"].astype(np.float32).transpose(2,0,1)/255.0
+    z, d = belief_zd            # posterior of current frame (already updated)
+    recon0 = wm.decoder(z, d).mean.squeeze(0).cpu()
+
+    # ---------- 2. imagine K steps (priors) -----------------
+    zs, ds, frames = [z], [d], [recon0]
+    onehots = torch.stack([onehot(a,wm) for a in action_plan]).unsqueeze(0)
+
+    with torch.no_grad():
+        for t in range(len(action_plan)):
+            d = wm.rssm.recurrent_model(zs[-1], onehots[:,t], ds[-1])
+            _, z = wm.rssm.transition_model(d)   # PRIOR
+            zs.append(z);  ds.append(d)
+            frames.append( wm.decoder(z, d).mean.squeeze(0).cpu() )
+
+    # ---------- 3. build & save grid ------------------------
+    frames = [fr.unsqueeze(0) for fr in frames]          #  → list of 1×3×64×64
+    grid   = torch.cat([torch.tensor(rgb).unsqueeze(0)]  # ground-truth 1×3×64×64
+                    + frames,
+                    dim=0)          
+    grid = torch.nn.functional.interpolate(grid, size=256,
+                                            mode="nearest")  # pixel-art
+    fname = outdir / f"probe_{len(list(outdir.glob('probe_*.png'))):03d}.png"
+    save_image(grid, fname, nrow=len(frames)+1, normalize=True)
+    print("saved", fname)
+def save_decoder(belief_zd,obs):
+            # --- grab one RGB frame from the env -------------------------------
+        OUTDIR   = Path("recon_demo")         # ./recon_demo/…
+        OUTDIR.mkdir(exist_ok=True)
+
+        #z0,d0= wm.rssm.recurrent_model_input_init(1)                         # posterior (current belief)
+        z0,d0=belief_zd
+        # ---- choose any action pattern you want the model to fantasise ----
+        plan      = ["forward","left", "right", "forward", "forward"]   # length = K
+        onehots   = torch.stack([onehot(a, wm) for a in plan]).unsqueeze(0)
+        zs, ds    = [z0], [d0]
+
+        # ---- latent roll-out (PRIOR predictions!) -------------------------
+        for t in range(len(plan)):
+            d_next  = wm.rssm.recurrent_model(zs[-1], onehots[:, t], ds[-1])
+            _, z_next = wm.rssm.transition_model(d_next)      # sample from p(zₜ₊₁)
+            zs.append(z_next);  ds.append(d_next)
+
+        # ---- decode all latents ------------------------------------------
+        with torch.no_grad():
+            recons = torch.stack([wm.decoder(z, d).mean.squeeze(0).cpu()
+                                for z, d in zip(zs, ds)])   # (K+1,3,64,64)
+
+        # ---- build a pretty  grid  (1×truth  +  K+1×pred) -----------------
+        truth = obs["image"].astype(np.float32).transpose(2,0,1)/255.0
+        grid  = torch.cat([torch.tensor(truth).unsqueeze(0), recons], dim=0)
+
+        # upscale to 256 px per tile for readability
+        grid_big = torch.nn.functional.interpolate(grid, size=256,
+                                                mode="bilinear", align_corners=False)
+
+        fname = OUTDIR / f"recon_{len(list(OUTDIR.glob('recon_*.png'))):03d}.png"
+        save_image(grid_big, fname, nrow=len(plan)+1, normalize=True)
+        print(f"[demo] saved  →  {fname}")
 
 # ══════════════════════════════════════════════════════════════════════
 # 4.  QUICK SELF-TEST  (python -m dreamer_mg.world_model_utils)
@@ -245,29 +313,6 @@ if __name__ == "__main__":
     from torchvision.utils import save_image
     import os, itertools
     from pathlib import Path
-
-    CKPT = "runs/mg_collision/20250630-165944/ckpt/iter01210.pt"
-    wm   = load_world_model2(CKPT)
-    print(f"[demo] loaded WM from {CKPT}")
-    
-
-    # ------------ env --------------------------------------------------
-    env = gym.make("MiniGrid-4-tiles-ad-rooms-v0",
-                   rooms_in_row=3, rooms_in_col=4)
-    env = RGBImgPartialObsWrapper(env)
-    env = ImgActionObsWrapper(env)
-    env = DictResizeObs(env, (64, 64))
-    #env = ChannelFirstEnv(env)                # (3,64,64)
-    seed=218
-    env.seed(seed)
-    obs  = env.reset()
-    obs, _, done, _ = env.step(env.actions.forward)
-    env.render(tile_size=64)
-
-    # ------------ belief & bookkeeping --------------------------------
-    belief_zd      = None
-    prev_act_1h    = None
-    FPS            = 6
     # three relative target offsets (dx,dy,dir)
     LOCAL_GOALS = [(4, 2, 0), (-3, 0, 2), (6, 2, 3)]   # ahead / left / right
 
@@ -296,121 +341,118 @@ if __name__ == "__main__":
                    )
             status = "NO-PATH" if not plan else f"plan {plan}"
             print(f"[goal {i}]  {g}  →  {status}")
+    CKPT = "runs/mg_collision/20250704-220917/ckpt/iter00700.pt"
 
-    def update_belief_from_obs(obs_dict, prev_onehot):
-        frame = obs_dict["image"].transpose(2,0,1) / 255.0   # ★ (3,64,64) float
-        return wm_update_belief(wm, belief_zd, frame, prev_onehot)
-    def probe_decoder(wm, belief_zd, obs, action_plan, outdir="recon_demo"):
-        outdir = Path(outdir); outdir.mkdir(exist_ok=True)
-
-        # ---------- 0. utilities --------------------------------
-        def to_onehot(a_name):
-            v = torch.zeros(wm.action_size, device=DEVICE)
-            v[wm.idx[a_name]] = 1.0
-            return v
-
-        # ---------- 1. current posterior ------------------------
-        rgb = obs["image"].astype(np.float32).transpose(2,0,1)/255.0
-        z, d = belief_zd            # posterior of current frame (already updated)
-        recon0 = wm.decoder(z, d).mean.squeeze(0).cpu()
-
-        # ---------- 2. imagine K steps (priors) -----------------
-        zs, ds, frames = [z], [d], [recon0]
-        onehots = torch.stack([to_onehot(a) for a in action_plan]).unsqueeze(0)
-
-        with torch.no_grad():
-            for t in range(len(action_plan)):
-                d = wm.rssm.recurrent_model(zs[-1], onehots[:,t], ds[-1])
-                _, z = wm.rssm.transition_model(d)   # PRIOR
-                zs.append(z);  ds.append(d)
-                frames.append( wm.decoder(z, d).mean.squeeze(0).cpu() )
-
-        # ---------- 3. build & save grid ------------------------
-        frames = [fr.unsqueeze(0) for fr in frames]          #  → list of 1×3×64×64
-        grid   = torch.cat([torch.tensor(rgb).unsqueeze(0)]  # ground-truth 1×3×64×64
-                        + frames,
-                        dim=0)          
-        grid = torch.nn.functional.interpolate(grid, size=256,
-                                            mode="nearest")  # pixel-art
-        fname = outdir / f"probe_{len(list(outdir.glob('probe_*.png'))):03d}.png"
-        save_image(grid, fname, nrow=len(frames)+1, normalize=True)
-        print("saved", fname)
+    wm   = load_world_model2(CKPT)
+    print(f"[demo] loaded WM from {CKPT}")
+    print("onehot('forward'):", onehot("forward", wm))
+    print("onehot mapping OK ✓")
     
-    def save_decoder(belief_zd,obs):
-            # --- grab one RGB frame from the env -------------------------------
-        OUTDIR   = Path("recon_demo")         # ./recon_demo/…
-        OUTDIR.mkdir(exist_ok=True)
 
-        z0,d0= wm.rssm.recurrent_model_input_init(1)                         # posterior (current belief)
-        #z0,d0=belief_zd
-        # ---- choose any action pattern you want the model to fantasise ----
-        plan      = ["forward","left", "right", "forward", "forward"]   # length = K
-        onehots   = torch.stack([onehot(a, wm) for a in plan]).unsqueeze(0)
-        zs, ds    = [z0], [d0]
+    # ------------ env --------------------------------------------------
+    env = gym.make("MiniGrid-4-tiles-ad-rooms-v0",
+                   rooms_in_row=3, rooms_in_col=4)
+    env = RGBImgPartialObsWrapper(env)
+    env = ImgActionObsWrapper(env)
+    env = DictResizeObs(env, (64, 64))
+    #env = ChannelFirstEnv(env)                # (3,64,64)
+    seed=218
+    env.seed(seed)
+    obs  = env.reset()
+        # ============ PROPER INITIALIZATION ============
+    # Start with proper initial state
+    z0, d0 = wm.rssm.recurrent_model_input_init(1)
 
-        # ---- latent roll-out (PRIOR predictions!) -------------------------
-        for t in range(len(plan)):
-            d_next  = wm.rssm.recurrent_model(zs[-1], onehots[:, t], ds[-1])
-            _, z_next = wm.rssm.transition_model(d_next)      # sample from p(zₜ₊₁)
-            zs.append(z_next);  ds.append(d_next)
+    # Get initial frame and encode it
+    frame0 = obs["image"].astype(np.float32).transpose(2, 0, 1) / 255.0
+    emb0 = wm.encoder(torch.tensor(frame0, device=DEVICE).unsqueeze(0))
 
-        # ---- decode all latents ------------------------------------------
-        with torch.no_grad():
-            recons = torch.stack([wm.decoder(z, d).mean.squeeze(0).cpu()
-                                for z, d in zip(zs, ds)])   # (K+1,3,64,64)
+    # Get initial posterior from the starting observation
+    # This is crucial - we need to get the posterior that corresponds to the actual initial state
+    _, z0 = wm.rssm.representation_model(emb0.view(1, -1), d0)
 
-        # ---- build a pretty  grid  (1×truth  +  K+1×pred) -----------------
-        truth = obs["image"].astype(np.float32).transpose(2,0,1)/255.0
-        grid  = torch.cat([torch.tensor(truth).unsqueeze(0), recons], dim=0)
+    print("Initial state synchronized with environment")
 
-        # upscale to 256 px per tile for readability
-        grid_big = torch.nn.functional.interpolate(grid, size=256,
-                                                mode="bilinear", align_corners=False)
+    # Take one step in the environment
+    obs, _, done, _ = env.step(env.actions.forward)    
+    frame1 = obs["image"].astype(np.float32).transpose(2, 0, 1) / 255.0
+    onehot_fwd = onehot("forward", wm).unsqueeze(0)
 
-        fname = OUTDIR / f"recon_{len(list(OUTDIR.glob('recon_*.png'))):03d}.png"
-        save_image(grid_big, fname, nrow=len(plan)+1, normalize=True)
-        print(f"[demo] saved  →  {fname}")
+    # ============ PROPER STATE UPDATE ============
+    # Update deterministic state with the action we took
+    d1 = wm.rssm.recurrent_model(z0, onehot_fwd, d0)
+
+    # Get posterior from the new observation
+    emb1 = wm.encoder(torch.tensor(frame1, device=DEVICE).unsqueeze(0))
+    _, z1 = wm.rssm.representation_model(emb1.view(1, -1), d1)
+
+    # Decode the posterior to verify we're in the right state
+    recon_post = wm.decoder(z1, d1).mean.squeeze(0)
+
+    print("After one step - state updated")
+
+    # ============ PROPER IMAGINATION ============
+    # Now imagine forward steps using the CURRENT state as starting point
+    priors = []
+    z_current, d_current = z1, d1  # Start from current synchronized state
+
+    for step in range(2):
+        # Update deterministic state with forward action
+        d_current = wm.rssm.recurrent_model(z_current, onehot_fwd, d_current)
         
+        # Get prior (imagined) stochastic state
+        _, z_current = wm.rssm.transition_model(d_current)
+        
+        # Decode the imagined state
+        imagined_frame = wm.decoder(z_current, d_current).mean.squeeze(0).cpu()
+        priors.append(imagined_frame)
+        
+        print(f"Imagined step {step + 1}")
 
+    # Save comparison
+    save_image(
+        torch.stack([torch.tensor(frame1), recon_post] + priors),
+        "recon_debug_fixed.png", nrow=4, normalize=True
+    )
+    print("wrote recon_debug_fixed.png")
+
+    # ============ ADDITIONAL DEBUGGING ============
+    # Let's also check if we can reconstruct the initial frame correctly
+    recon_initial = wm.decoder(z0, d0).mean.squeeze(0)
+    save_image(
+        torch.stack([torch.tensor(frame0), recon_initial]),
+        "initial_recon_debug.png", nrow=2, normalize=True
+    )
+    print("wrote initial_recon_debug.png - check if initial reconstruction is correct")
+
+    # Print state shapes for debugging
+    print(f"z0 shape: {z0.shape}, d0 shape: {d0.shape}")
+    print(f"z1 shape: {z1.shape}, d1 shape: {d1.shape}")
+
+
+
+    belief_zd      = None
+    prev_act_1h = None
+    belief_zd = update_belief_from_obs(obs,belief_zd, prev_act_1h)
+    obs, _, done, _ = env.step(env.actions.forward)
+    env.render(tile_size=64)
+
+    # ------------ belief & bookkeeping --------------------------------
+    prev_act_1h = onehot("forward", wm)
+    FPS            = 6
     
-
     # ------------------------------------------------------------------
-    belief_zd = update_belief_from_obs(obs, prev_act_1h)
+    belief_zd = update_belief_from_obs(obs,belief_zd, prev_act_1h)
     query_three_goals(step=0,start=obs['pose'])
     
     
     save_decoder(belief_zd,obs)
     probe_decoder(wm, belief_zd, obs,     # current posterior
               action_plan = ["forward","forward","left","forward"])
-    z0,d0= belief_zd
-    # after one real step -------------------------------------------------
-    frame1 = obs["image"].astype(np.float32).transpose(2,0,1) / 255.0
-    onehot_fwd = onehot("forward", wm).unsqueeze(0)            # (1,7)
-
-    # 1️⃣ get posterior z₁,d₁ from the *real* next frame
-    emb = wm.encoder(torch.tensor(frame1, device=DEVICE).unsqueeze(0))
-    d0  = wm.rssm.recurrent_model(z0, onehot_fwd, d0)          # update hidden state
-    _, z1 = wm.rssm.representation_model(emb.view(1, -1), d0)  # posterior
-
-    # 2️⃣ decode that posterior              → how well do we reconstruct?
-    recon_post = wm.decoder(z1, d0).mean.squeeze(0)     # (3,64,64)
-
-    # 3️⃣ now imagine two *prior* steps ahead with the same “forward” action
-    z, d = z1, d0
-    priors = []
-    for _ in range(2):
-        d = wm.rssm.recurrent_model(z, onehot_fwd, d)
-        _, z = wm.rssm.transition_model(d)     # PRIOR
-        priors.append(wm.decoder(z, d).mean.squeeze(0).cpu())
-
-    save_image(
-        torch.stack([torch.tensor(frame1), recon_post] + priors),
-        "recon_debug.png", nrow=5, normalize=True
-    )
-    print("wrote recon_debug.png")
+    
     # ------------ phase 1 : drive 4 steps straight --------------------
     for t in range(4):
-        belief_zd = update_belief_from_obs(obs, prev_act_1h)
+        belief_zd = update_belief_from_obs(obs,belief_zd, prev_act_1h)
         prev_act_1h = onehot("forward", wm)          # hard-coded forward
         obs, _, done, _ = env.step(env.actions.forward)
         #print(obs['pose'])
@@ -428,7 +470,7 @@ if __name__ == "__main__":
     
     # ------------ phase 2 : drive 2 more steps ------------------------
     for t in range(2):
-        belief_zd = update_belief_from_obs(obs, prev_act_1h)
+        belief_zd = update_belief_from_obs(obs,belief_zd, prev_act_1h)
         prev_act_1h = onehot("forward", wm)
         obs, _, done, _ = env.step(env.actions.forward)
         env.render(tile_size=64)
