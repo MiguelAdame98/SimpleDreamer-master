@@ -554,10 +554,19 @@ class WMPlanner:
                 frames.append(frame.cpu())
 
         return frames
-    
+    def _prepare_frame(self,obs: dict, out_hw=(64, 64)):
+        assert "image" in obs, "observation lacks 'image' key"
+        img = obs["image"]                                   # H×W×3, uint8 or float
+        if img.dtype != np.float32:                          # uint8 → float 0-1
+            img = img.astype(np.float32) / 255.0
+        if img.shape[:2] != out_hw:                          # resize if needed
+            img = cv2.resize(img, out_hw[::-1], interpolation=cv2.INTER_AREA)
+        img = img.transpose(2, 0, 1)                         # to CHW
+        img = img - 0.5                                      # centre at 0
+        return img                                           # (3,64,64) float32
     def update_belief_from_obs(self,obs_dict,belief_zd, prev_onehot):
             
-        frame = obs_dict["image"].transpose(2,0,1) / 255.0-0.5   # ★ (3,64,64) float
+        frame = self._prepare_frame(obs_dict)       # ★ (3,64,64) float
         return self.wm_update_belief(self.wm, belief_zd, frame, prev_onehot)
     def probe_decoder(self,wm, belief_zd, obs, action_plan, outdir="recon_demo"):
         outdir = Path(outdir); outdir.mkdir(exist_ok=True)
