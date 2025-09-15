@@ -30,7 +30,7 @@ parameters:
     batch_length:              30
     collect_interval:          100
     num_interaction_episodes:  1
-    seed_episodes:             100
+    seed_episodes:             10
     num_evaluate:              3
 
     # objective -------------------------------------------------------------
@@ -87,6 +87,19 @@ parameters:
       hidden_size: 400
       num_layers:  2
       activation:  ELU
+    agent :
+      actor :
+        hidden_size : 400
+        min_std : 0.0001
+        init_std : 5.
+        mean_scale : 5
+        activation : ELU
+        num_layers : 2
+
+      critic : 
+          hidden_size : 400
+          activation : ELU
+          num_layers : 3 
 
 
   

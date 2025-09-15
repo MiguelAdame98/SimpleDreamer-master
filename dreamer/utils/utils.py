@@ -15,6 +15,7 @@ import torch.nn.functional as F
 import yaml
 from attrdict import AttrDict
 
+
 def new_run_dir(base="./runs", exp_name="minigrid"):
     ts   = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     path = pathlib.Path(base) / exp_name / ts
@@ -158,10 +159,74 @@ def get_base_directory():
     return "/".join(find_file("main.py").split("/")[:-1])
 
 
-def load_config(config_path):
+'''def load_config(config_path):
     if not config_path.endswith(".yml"):
         config_path += ".yml"
     config_path = find_file(config_path)
     with open(config_path) as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
-    return AttrDict(config)
+    return AttrDict(config)'''
+
+import yaml, pprint
+from pathlib import Path
+
+
+def _merge_dicts(a: dict, b: dict) -> dict:
+    """Recursively merge two dicts.  Keys in *b* override keys in *a*."""
+    merged = dict(a)
+    for k, v in b.items():
+        if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
+            merged[k] = _merge_dicts(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
+
+def _to_attrdict(d):
+    """Turn nested dicts into dot-accessible namespaces."""
+    if isinstance(d, dict):
+        return AttrDict({k: _to_attrdict(v) for k, v in d.items()})
+    elif isinstance(d, list):
+        return [_to_attrdict(x) for x in d]
+    else:
+        return d
+
+def load_config(cfg_path: str):
+    """
+    Load YAML at *cfg_path*.
+    If it contains a key `base_config: some_file.yml` we load that first
+    and let the *current* file override it.
+    Returns an AttrDict exactly like the original helper did.
+    """
+
+    cfg_path = Path(cfg_path).expanduser()
+    if not cfg_path.suffix:
+        cfg_path = cfg_path.with_suffix(".yml")
+    assert cfg_path.exists(), f"Config file not found: {cfg_path}"
+
+    # -------- 1. load the run-specific YAML ---------------------------------
+    with cfg_path.open() as f:
+        yaml_cfg = yaml.safe_load(f)
+
+    # -------- 2. optionally load a base config ------------------------------
+    base_cfg = {}
+    if "base_config" in yaml_cfg:
+        base_path = (cfg_path.parent / yaml_cfg["base_config"]).resolve()
+        with base_path.open() as f:
+            base_cfg = yaml.safe_load(f)
+
+    # -------- 3. merge so YAML-file values override base --------------------
+    merged_cfg = _merge_dicts(base_cfg, yaml_cfg)
+
+    # -------- 4. debug prints ----------------------------------------------
+    try:
+        seed_nested = (
+            merged_cfg["parameters"]["dreamer"]["seed_episodes"]
+        )
+    except KeyError:
+        seed_nested = "N/A"
+
+    print("\n[Debug-cfg] loaded YAML from", cfg_path)
+    print("[Debug-cfg] seed_episodes after merge →", seed_nested, "\n")
+
+    # -------- 5. return as AttrDict (dot-style access) ----------------------
+    return _to_attrdict(merged_cfg)

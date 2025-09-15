@@ -19,6 +19,8 @@ import random
 import gym_minigrid
 from gym_minigrid.minigrid import Wall
 
+
+
 # --------------------------------------------------------------------------- #
 #  nice-looking logger                                                        #
 # --------------------------------------------------------------------------- #
@@ -60,6 +62,7 @@ class Dreamer:
 
         # ---------- networks --------------------------------------------- #
         self.encoder           = Encoder(observation_shape, config).to(device)
+        print("observation shape", observation_shape)
         self.decoder           = Decoder(observation_shape, config).to(device)
         self.rssm              = RSSM(action_size, config).to(device)
         self.reward_predictor  = RewardModel(config).to(device)
@@ -104,27 +107,39 @@ class Dreamer:
     # placeholder until you plug actor-critic
     def behavior_learning(self, *_):
         return
+    def _latest_ckpt_by_mtime(self, ckpt_dir: Path) -> Path | None:
+        """
+        Return the most recently *modified* checkpoint in ckpt_dir,
+        or None if the directory is empty.
+        """
+        ckpts = sorted(ckpt_dir.glob("iter*.pt"),
+                    key=lambda p: p.stat().st_mtime)
+        return ckpts[-1] if ckpts else None
 
     # ..................................................................... #
     def train(self, env):
         # seed episodes --------------------------------------------------- #
+        print(f"[Debug] seed_episodes = {self.config.seed_episodes}")
+        '''need_seed = (len(self.buffer) < 1) and (getattr(self, "start_iter", 1) == 1)
+        if need_seed:'''
         if len(self.buffer) < 1:
             self.environment_interaction(env, self.config.seed_episodes)
-
         ckpt_every = 50                       # iterations
         ckpt_dir   = self.run_dir / "ckpt"
         if ckpt_dir and not ckpt_dir.exists():
             ckpt_dir.mkdir(parents=True)
 
         # resume if a *.pt file already exists ----------------------------------
-        latest = sorted(ckpt_dir.glob("iter*.pt"))[-1] if list(ckpt_dir.glob("iter*.pt")) else None
+        latest = self._latest_ckpt_by_mtime(ckpt_dir)
         if latest:
             self._load_ckpt(latest)
-            print(f"[Dreamer] resumed from {latest.name}")
-
+        else:
+            print("[Dreamer] no checkpoint found → fresh run")
 
         # main loop ------------------------------------------------------- #
-        for it in range(1, self.config.train_iterations + 1):
+        if not hasattr(self, "start_iter"):          # fresh run
+            self.start_iter = 1
+        for it in range(self.start_iter, self.config.train_iterations + 1):
             log.info("⇢ iteration %d/%d", it, self.config.train_iterations)
 
             # --- model training cycles ---------------------------------- #
@@ -138,11 +153,7 @@ class Dreamer:
                 if c % 10 == 0:
                     log.debug("   collect %d/%d  buffer len: %d",
                               c, self.config.collect_interval, len(self.buffer))
-            
-                    
-
-
-
+       
             # --- interact with env -------------------------------------- #
             self.environment_interaction(env,
                                          self.config.num_interaction_episodes)
@@ -178,17 +189,57 @@ class Dreamer:
         torch.save(state, path)
         print(f"[ckpt] saved → {path.name}")
 
-    def _load_ckpt(self, path):
+    def _load_ckpt(self, path: Path):
+        """
+        Load a checkpoint with shape-safe parameter matching.
+        Any tensor whose shape differs from the current module’s tensor
+        is *skipped* and reported, so the run can continue instead of crashing.
+        """
+
         ckpt = torch.load(path, map_location=self.device)
-        for n, m in self._modules().items():
-            m.load_state_dict(ckpt["modules"][n])
-        for n, o in {"model": self.model_optimizer,
-                    "actor": getattr(self, "actor_optimizer", None),
-                    "critic":getattr(self,"critic_optimizer", None)}.items():
-            if o and n in ckpt["opt"]:
-                o.load_state_dict(ckpt["opt"][n])
+        skipped = []                     # for reporting
+
+        # --- 1. modules ----------------------------------------------------
+        for name, module in self._modules().items():
+            own_state   = module.state_dict()
+            ckpt_state  = ckpt["modules"][name]
+
+            # pick only tensors with identical shape
+            ok_tensors = {
+                k: v for k, v in ckpt_state.items()
+                if k in own_state and v.shape == own_state[k].shape
+            }
+            module.load_state_dict({**own_state, **ok_tensors})
+            for k in ckpt_state:
+                if k not in ok_tensors:
+                    skipped.append(f"{name}.{k}  "
+                                f"ckpt{tuple(ckpt_state[k].shape)} "
+                                f"≠ current{tuple(own_state[k].shape)}")
+
+        # --- 2. optimizers -------------------------------------------------
+        for n, opt in {
+            "model":   getattr(self, "model_optimizer", None),
+            "actor":   getattr(self, "actor_optimizer", None),
+            "critic":  getattr(self, "critic_optimizer", None),
+        }.items():
+            if opt and n in ckpt["opt"]:
+                try:
+                    opt.load_state_dict(ckpt["opt"][n])
+                except ValueError:          # param mismatch → reset optimiser
+                    print(f"[Warn] optimiser '{n}' state skipped (shape mismatch)")
+                    pass
+
+        # --- 3. RNG & iteration counter -----------------------------------
         torch.random.set_rng_state(ckpt["rng"])
         self.start_iter = ckpt.get("iter", 0) + 1
+
+        # --- 4. report -----------------------------------------------------
+        print(f"[Dreamer] ✔ loaded {path.name}  → start_iter={self.start_iter}")
+        if skipped:
+            print("[Dreamer]   ⚠ skipped tensors:")
+            for s in skipped:
+                print("            ·", s)
+    # ----------------------------------------------------------------------
     # ..................................................................... #
     def evaluate(self, env):
         self.environment_interaction(env,
@@ -199,13 +250,26 @@ class Dreamer:
     def dynamic_learning(self, data):
         # roll out through time ------------------------------------------ #
         prior, det = self.rssm.recurrent_model_input_init(len(data.action))
+        print(len(data.action))
+        print("prior",prior.shape, det.shape)
+        print(data.observation.shape)
+        
         data.embedded_observation = self.encoder(data.observation)
+        print("image",data.embedded_observation.shape)
 
         for t in range(1, self.config.batch_length):
+            #print(data.action[:, t-1])
+            x=data.action[:, t-1]
+            print(x.shape)
+            print("action",data.action.shape)
             det = self.rssm.recurrent_model(prior, data.action[:, t-1], det)
+            print("det",det.shape)
             prior_dist, prior = self.rssm.transition_model(det)
             post_dist, post   = self.rssm.representation_model(
                                     data.embedded_observation[:, t], det)
+            print(data.embedded_observation[:, t].shape)
+            print("jyuygyu")
+            print(post.shape,prior.shape)
 
             self.dynamic_learning_infos.append(
                 priors                = prior,
@@ -218,30 +282,6 @@ class Dreamer:
             )
             prior = post
 
-            if (self.global_step < 3) and (t == 1):          # only for first batches
-                b = 0                                         # look at batch element 0
-                # a) raw env action that goes into GRU
-                print(f"[dbg]  action[{b},{t-1}] =", data.action[b, t-1].cpu().numpy())
-
-                # b) latent statistics BEFORE representation model
-                print("[dbg]  prior mean±std",
-                    prior[b].mean().item(), prior[b].std().item())
-                print("[dbg]  det   mean±std",
-                    det  [b].mean().item(), det  [b].std().item())
-
-                # c) how different is posterior from prior at t?
-                diff = (post[b] - prior[b]).norm() / np.sqrt(post[b].numel())
-                print("[dbg]  ||posterior – prior||₂ per-dim ≈", diff.item())
-
-                # d) quick visual check – save recon vs. ground truth
-                import torchvision.utils as vutils, os
-                gt      = data.observation[b, t]              # (3,64,64)
-                recon_t = self.decoder(post[b:b+1], det[b:b+1]).mean.squeeze(0)
-                grid    = torch.stack([gt.cpu(), recon_t.cpu()])
-                os.makedirs("dbg", exist_ok=True)
-                vutils.save_image(grid, f"dbg/recon_g{self.global_step}_t{t}.png",
-                                nrow=2, normalize=True)
-
         infos = self.dynamic_learning_infos.get_stacked()
         losses = self._model_update(data, infos)
 
@@ -252,23 +292,36 @@ class Dreamer:
     # ..................................................................... #
     def _model_update(self, data, infos):
         # ───────────────────────── reconstruction (image log-likelihood) ──────
+        if not hasattr(self, "_printed_shapes"):
+            b = 0                                         # look at batch element 0
+            print("\n>>> DEBUG: shapes entering _model_update")
+            print("posteriors      :", infos.posteriors.shape,
+                "dtype", infos.posteriors.dtype)
+            print("deterministics  :", infos.deterministics.shape,
+                "dtype", infos.deterministics.dtype)
+
+            # basic stats to make sure values aren’t all zero or huge
+            print("posterior mean±std  :", infos.posteriors.mean().item(),
+                "±", infos.posteriors.std().item())
+            print("deterministic mean±std:", infos.deterministics.mean().item(),
+                "±", infos.deterministics.std().item())
+
+            # pass one pair through the decoder and print output range
+            sample_img = self.decoder(
+                            infos.posteriors[b:b+1, 0],      # (1, Z)
+                            infos.deterministics[b:b+1, 0]   # (1, H)
+                        ).mean
+            print("decoder out shape :", sample_img.shape,
+                "range", sample_img.min().item(), "…", sample_img.max().item())
+            recon_dist  = self.decoder(infos.posteriors, infos.deterministics)
+            print("decoder out shape :",recon_dist)
+            #print(recon_dist.shape)
+            self._printed_shapes = True
         recon_dist  = self.decoder(infos.posteriors, infos.deterministics)
-        if (self.global_step < 3):
-            b = 0
-            # average PSNR of posterior reconstruction over the whole sequence
-            mse = ((recon_dist.mean[b] - data.observation[b,1:].to(self.device))**2).mean()
-            psnr = -10 * torch.log10(mse).item()
-            print(f"[dbg]  PSNR posterior recon (batch {b}) = {psnr:.1f} dB")
-
-            # prior reconstruction for the last time-step
-            prior_img = self.decoder(infos.priors[b:b+1,-1], infos.deterministics[b:b+1,-1]).mean
-            gt_img    = data.observation[b,-1]
-            mse = ((prior_img - gt_img.to(prior_img.device))**2).mean()
-            psnr = -10 * torch.log10(mse).item()
-            print(f"[dbg]  PSNR 1-step PRIOR (last step)  = {psnr:.1f} dB")
-
         recon_loss  = recon_dist.log_prob(data.observation[:, 1:])          # <── moved up
-
+        
+        print("shapeeeee")
+        print(data.observation[:, 1:].shape)
         # ───────────────────────── continue flag (optional) ───────────────────
         if self.config.use_continue_flag:
             cont_dist = self.continue_predictor(infos.posteriors,
@@ -313,7 +366,8 @@ class Dreamer:
         # ─── tiny visual probe every 200 optimisation steps  ---------------
         # save to  runs/<TIMESTAMP>/recon/recon_00012.png  (auto-created dir)
         self._vis_counter = getattr(self, "_vis_counter", 0)
-        if getattr(self, "_vis_counter", 0) % 250 == 0:
+        xyx=5
+        if getattr(self, "_vis_counter", 0) % xyx == 0:
            
             with torch.no_grad():                       # ← important: no grads!
                 outdir = Path(self.run_dir) / "recon"
@@ -332,7 +386,7 @@ class Dreamer:
                                     ).mean.squeeze(0) # → (3,64,64)
 
                 # --- 3. 4-step dreamed rollout under a hand-picked cmd list -----
-                cmd = ["forward", "forward", "left", "forward"]
+                cmd = ["right", "left", "left", "forward"]
                 act_idx = torch.tensor([self.action_dict[a] for a in cmd],
                                     device=self.device)
                 onehots = F.one_hot(act_idx, num_classes=self.action_size).float()  # (T,3)
@@ -347,13 +401,21 @@ class Dreamer:
                     frame = self.decoder(z, d).mean.squeeze(0).cpu()
                     dreams.append(frame)
 
+                recon_last = self.decoder(
+                                infos.posteriors[0, -1:],
+                                infos.deterministics[0, -1:]
+                            ).mean.squeeze(0)
+
+                grid1 = torch.stack([data.observation[0, -1].cpu(),   # GT at t = T
+                                    recon_last.cpu(),                # posterior recon t = T
+                                    fantasy.cpu()])                  # prior recon   t = T
                 # --- save both grids (truth|recon|prior  & dreams) ---------------
-                grid1 = torch.stack([t0_img.cpu(), recon.cpu(), fantasy.cpu()])
-                save_image(grid1, outdir / f"recon_{self._vis_counter//50:05d}.png",
+                #grid1 = torch.stack([t0_img.cpu(), recon.cpu(), fantasy.cpu()])
+                save_image(grid1, outdir / f"recon_{self._vis_counter//xyx:05d}.png",
                         nrow=3, normalize=True)
 
-                grid2 = torch.stack([t0_img.cpu()] + dreams)  # 1+len(cmd) frames
-                save_image(grid2, outdir / f"dream_{self._vis_counter//50:05d}.png",
+                grid2 = torch.stack([data.observation[0, -1].cpu()] + dreams)  # 1+len(cmd) frames
+                save_image(grid2, outdir / f"dream_{self._vis_counter//xyx:05d}.png",
                         nrow=len(cmd)+1, normalize=True)
 
         self._vis_counter += 1
@@ -412,7 +474,7 @@ class Dreamer:
                     env_act = random.randrange(0,3)
               
                 buffer_act = np.eye(self.action_size, dtype=np.float32)[env_act]
-                print(buffer_act)
+            
                 next_obs, reward, done, _ = env.step(env_act)
                 
                 
