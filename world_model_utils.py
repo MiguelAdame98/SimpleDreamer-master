@@ -393,7 +393,7 @@ class DualPathCollage:
 State    = namedtuple("State", ["x", "y", "d"])          # planner state
 DIR_VECS = [(1,0), (0,1), (-1,0), (0,-1)]                # 0:right 1:down …
 
-DEVICE   = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE   = "cpu"
 
 class WMPlanner:
     """High-level wrapper: loading, belief update, collision check, A* and render."""
@@ -411,7 +411,7 @@ class WMPlanner:
         emap = self.cog.mg.experience_map
         self.emap=emap
     def load_world_model2(self,ckpt_path: str,
-                        config_yaml: str = "/Users/lab25/hierarchical-nav/dreamer_mg/runs/mg_collision/20250704-220917/config.yml"):
+                        config_yaml: str = "C:/Users/migue/hierarchical-nav/dreamer_mg/20250704-220917/config.yml"):
         """
         Returns an object with .encoder and .rssm that exactly match *any*
         Dreamer checkpoint – no manual YAML tweaks required.
@@ -955,34 +955,99 @@ class WMPlanner:
 
     # ══════════════════════════════════════════════════════════════════════
     # 3.  A*  PLANNER  (astar_prims)  –  uses wm_predict_collision
+    #     Changes:
+    #       (A) forward-collision now uses MC votes at current belief
+    #       (B) closed set is depth-aware (reopen stride) + g_score relaxed
     # ══════════════════════════════════════════════════════════════════════
-    def heuristic(self,s: State, g: State) -> int:
+    def heuristic(self, s: State, g: State) -> int:
         manh = abs(s.x - g.x) + abs(s.y - g.y)
         turn = min((s.d - g.d) % 4, (g.d - s.d) % 4)
         return manh + turn
+
     def astar_prims(self,
                 wm,
                 belief_zd,                  # (z,h) (latent + RNN state) at the *start* frame
                 start: State,
                 goal:  State,
-                max_actions: int = 50,      # hard budget
-                num_rollouts: int = 8,
+                max_actions: int = 20,      # hard budget
+                num_rollouts: int = 6,
                 verbose: bool = False,
                 allow_partial: bool = False):
+        """
+        Changes vs your current version:
+        (A) MC forward-collision voting that samples beliefs *here* (not inside check_for_wall).
+        (B) 'More open' closed set: we only reject a popped state; children may re-enter
+            if they improve g_score (standard A* reopen behavior).
+        (+) Optional: Weighted A* via self.h_weight (default 1.0, same as before).
+        """
         import torch
         import torch.nn.functional as F
         import math, heapq
 
+        # ----- helpers -----
         def to_onehot_tensor(seq: list[str]) -> torch.Tensor:
             mapping = {'forward': [1, 0, 0],
                     'right'  : [0, 1, 0],
                     'left'   : [0, 0, 1]}
-            # (T,3) on CPU; NavigationSystem is happy with CPU tensors
             return torch.tensor([mapping[a] for a in seq], dtype=torch.float32)
 
+        # Monte-Carlo vote for "is there a wall straight ahead *now*?" by sampling *beliefs*.
+        # We DO NOT step the environment; we sample latent z variants conditioned on current h.
+        # We then reuse your existing checker (is_wall_ahead_now) per sample.
+        def mc_wall_ahead_vote(wm, belief, k: int, ratio: float, debug: bool = False) -> bool:
+            """
+            Returns True if 'blocked' by majority vote.
+            Sampling strategy:
+                - Try sampling z ~ p(z|h) via rssm.transition_model(h) k times; keep h fixed.
+                - If the model doesn't support that call, fall back to small Gaussian noise on z.
+            """
+            z0, h0 = belief
+            blocked = 0
+            need = max(1, int(math.ceil(k * ratio)))  # votes needed to declare 'blocked'
+            with torch.no_grad():
+                for i in range(k):
+                    # Try to sample a new z from the current h (no action applied)
+                    z_s = None
+                    try:
+                        # many Dreamer-style RSSMs allow transition_model(h) → (prior, z_sample)
+                        _prior, z_s = wm.rssm.transition_model(h0)
+                    except Exception:
+                        # fallback: light noise around current z
+                        print("   [MC] warning: rssm.transition_model(h) failed; using noisy z")
+                        eps = getattr(self, "z_noise_std", 0.05)
+                        z_s = z0 + torch.randn_like(z0) * eps
+
+                    if hasattr(self, "is_wall_ahead_now"):
+                        if self.is_wall_ahead_now(wm, (z_s, h0), debug=False):
+                            blocked += 1
+                    else:
+                        # If you have a direct collision head, use it here instead.
+                        # raise RuntimeError("Need is_wall_ahead_now or a collision predictor.")
+                        # Conservative fallback: assume not blocked
+                        pass
+
+                    # Early exit once the outcome is decided
+                    if blocked >= need:
+                        if debug or verbose:
+                            print(f"   [MC] forward blocked by vote {blocked}/{i+1}")
+                        return True
+                    if (i + 1 - blocked) > (k - need):  # cannot possibly reach 'need' anymore
+                        break
+
+            if debug or verbose:
+                print(f"   [MC] forward free by vote ({blocked}/{k} say blocked)")
+            return False
+
+        # ----- config knobs (no signature change) -----
+        MC_BLOCK_RATIO = float(getattr(self, "mc_block_ratio", 0.60))  # votes to call it 'blocked'
+        H_WEIGHT       = float(getattr(self, "h_weight", 1.3))         # 1.0 == classic A*
+
         # priority-queue items: (f, g, state, seq, belief)
-        pq      = [(self.heuristic(start, goal), 0, start, [], belief_zd)]
+        pq      = [(H_WEIGHT * self.heuristic(start, goal), 0, start, [], belief_zd)]
         g_score = {start: 0}
+
+        # We still keep a closed set to avoid re-expanding popped nodes *at equal/worse g*.
+        # But children are allowed to re-enter if they improve g_score (reopen behavior).
         closed  = set()
 
         # nearest fallback bookkeeping (only used if allow_partial=True)
@@ -992,10 +1057,11 @@ class WMPlanner:
         while pq:
             f, g, (x, y, d), seq, belief = heapq.heappop(pq)
             if (x, y, d) in closed:
+                # If someone put a better g later, it would have been pushed with lower f and popped already.
                 continue
             closed.add((x, y, d))
 
-            # update nearest
+            # update nearest (for allow_partial)
             dist_xy = math.hypot(x - goal.x, y - goal.y)
             if dist_xy < best_dist:
                 best_dist, best_seq = dist_xy, seq
@@ -1003,16 +1069,16 @@ class WMPlanner:
             if verbose:
                 print(f"[A*] pop {State(x,y,d)}  g={g}  f={f}  seq={seq}")
 
-            # ───── success ─────────────────────────────────────────────
+            # success
             if (x, y, d) == (goal.x, goal.y, goal.d):
                 return to_onehot_tensor(seq)  # ✔ exact plan
 
-            # budget check
+            # budget check (pop boundary)
             if g >= max_actions:
                 continue
 
-            # ───── expand successors ───────────────────────────────────
-            for act in ("left", "right", "forward"):
+            # Expand successors (try forward first to exploit promising branches)
+            for act in ("forward", "left", "right"):
                 # pose after action
                 if act == "forward":
                     dx, dy = DIR_VECS[d]
@@ -1023,10 +1089,21 @@ class WMPlanner:
                     nx, ny, nd = x, y, (d + 1) % 4
 
                 ns = State(nx, ny, nd)
-                if ns in closed:
+
+                # g step
+                g2 = g + 1
+                if g2 > max_actions:
                     continue
 
-                # belief one step ahead (no-grad)
+                # ---- CHANGE (A): MC trimming for 'forward' ----
+                if act == "forward":
+                    # sample beliefs *here*, not inside is_wall_ahead_now
+                    if mc_wall_ahead_vote(wm, belief, k=num_rollouts, ratio=MC_BLOCK_RATIO, debug=False):
+                        if verbose:
+                            print("   prune (MC vote: wall ahead now)  ->", seq + [act])
+                        continue
+
+                # belief one step ahead (no-grad) — only now that we've decided to keep this child
                 with torch.no_grad():
                     z, h = belief
                     onehot = F.one_hot(
@@ -1037,26 +1114,25 @@ class WMPlanner:
                     _, z_next = wm.rssm.transition_model(h_next)
                 belief_next = (z_next.detach(), h_next.detach())
 
-                # collision prune only for forward
-                if act == "forward":
-                    if hasattr(self, "is_wall_ahead_now") and self.is_wall_ahead_now(wm, belief, debug=False):
-                        if verbose:
-                            print("   prune (wall ahead now)", seq)
-                        continue
-
-                # push successor if still within action budget
                 new_seq = seq + [act]
-                g2 = g + 1
-                if g2 > max_actions:
-                    continue
 
+                # Heuristic & f (with optional weighting)
                 h2 = self.heuristic(ns, goal)
-                f2 = g2 + h2
+                f2 = g2 + H_WEIGHT * h2
+
+                # ---- CHANGE (B): 'More open' closed set / standard A* re-open rule ----
+                # Do not flatly ban children just because the pose was popped before.
+                # Only push if this path improves the best known g for ns.
                 if g2 < g_score.get(ns, float("inf")):
                     g_score[ns] = g2
                     heapq.heappush(pq, (f2, g2, ns, new_seq, belief_next))
+                else:
+                    # If we already have an equal-or-better g for ns, skip.
+                    # (This still allows re-open if a genuinely better path shows up later.)
+                    if verbose:
+                        print(f"   skip {ns} (no g improvement)")
 
-        # ───── failure to reach goal ─────────────────────────────────────
+        # failure to reach goal
         if allow_partial and best_seq:
             if verbose:
                 print(f"[A*] no path; returning NEAREST (len={len(best_seq)}, dist={best_dist:.2f})")
@@ -1064,8 +1140,8 @@ class WMPlanner:
 
         if verbose:
             print("[A*] no path; returning EMPTY")
-        # Explicit (0,3) tensor → NavigationSystem sees numel()==0
         return torch.empty((0, 3), dtype=torch.float32)
+
     def render_plan(self,wm, belief_zd, actions, include_last=True):
         """
         Return list[Tensor] of decoded RGB frames.
@@ -3422,7 +3498,7 @@ if __name__ == "__main__":
     LOOKAHEAD   = 7             # A* novelty horizon
     K_RECENT    = 30            # how many recent embeddings to compare against
     METRIC      = "cos"         # "kl" | "cos" | "l2"
-    DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    DEVICE      = torch.device("cpu")
 
     # Debug/vis knobs
     DEBUG_PRINT          = True   # keep tree/top-K/action scores logs

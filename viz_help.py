@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-unified_test_runner.py
+viz_help.py
 
 Standalone utilities for step-by-step video recording (env + GT obs + Dreamer decode +
 HMM panel + experience map + pose panel), designed to be reused across scripts.

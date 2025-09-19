@@ -124,6 +124,7 @@ class KBrain:
         self.viz_every=viz_every
         # ── HMM / meta-controller state
         self.hmm_bayes = HierarchicalBayesianController()
+        self.hmm_bayes.hhmm.bind_env(env)
         self.current_mode: str = "EXPLORE"
         self.current_submode: str = "base"  # neutral placeholder; new HMM is mode-only
         self.prev_mode: str | None = None
@@ -139,13 +140,6 @@ class KBrain:
         left    = [0,0,1]
         mingrid_actions = [forward, right, left]
         self.planner=planner
-
-        # ── Navigation system hooks into the memory_graph and your planner
-        self.nav_system = NavigationSystem(
-            self.planner.cog.mg,
-            lambda: self.agent_current_pose,
-            planner=self.planner
-        )
         
         mg = planner.cog.mg
         self.nav_system = NavigationSystem(
@@ -368,6 +362,114 @@ class KBrain:
         return action_name
 
        
+    def _compute_hmm_plan_progress(self, raw_nav_grade: float, grace_len: int = 15) -> float:
+        """
+        Convert nav grade → HMM plan progress with a *mode-aware* grace period.
+
+        Key fixes:
+        - Only arm grace when the plan finishes/damages while we are in NAVIGATE
+        or have very recently left NAVIGATE (mode gate).
+        - While in grace: return 0.0 so EXPLORE can win quickly.
+        - Outside grace: clamp raw grade to [0,1]. A grade of -1 is ignored unless
+        we were in NAVIGATE context (no accidental grace from sentinels).
+        """
+
+        # --- recent NAV context tracking (small horizon) ---
+        horizon = int(getattr(self, "_nav_recent_horizon", 2))  # steps considered "recent NAV"
+        try:
+            mode = getattr(self, "current_mode", "EXPLORE")
+        except Exception:
+            mode = "EXPLORE"
+
+        nav_recent_age = int(getattr(self, "_nav_recent_age", horizon + 1))
+        if mode == "NAVIGATE":
+            nav_recent_age = 0
+        else:
+            nav_recent_age = min(horizon + 1, nav_recent_age + 1)
+        self._nav_recent_age = nav_recent_age
+        in_or_recent_nav = (nav_recent_age <= horizon)
+
+        # --- current nav-system progress sentinel (finish/damaged) ---
+        try:
+            plan_prog = float(self.nav_system.progress_scalar())
+        except Exception:
+            plan_prog = 0.0
+
+        plan_finished = (plan_prog > 1.0)            # explicit DONE from nav system
+        plan_damaged  = (raw_nav_grade == -1.0) or (plan_prog < 0.0)  # only meaningful in NAV context
+
+        # --- grace TTL (only arm if in NAV or very recently left NAV) ---
+        ttl = int(getattr(self, "_nav_grace_ttl", 0))
+        if in_or_recent_nav and (plan_finished or plan_damaged):
+            ttl = int(getattr(self, "_nav_grace_len", grace_len))  # allow external override
+            if getattr(self, "debug_print", False):
+                print(f"[HMM] nav-grace ARMED: finished={plan_finished} damaged={plan_damaged} "
+                    f"ttl={ttl} (mode={mode}, age={nav_recent_age})")
+
+        # --- while grace is active, damp to zero and count down ---
+        if ttl > 0:
+            ttl -= 1
+            self._nav_grace_ttl = ttl
+            if getattr(self, "debug_print", False):
+                print(f"[HMM] nav-grace ACTIVE → ttl={ttl}")
+            return 0.0
+
+        # disarm when not active
+        self._nav_grace_ttl = 0
+
+        # --- outside grace: map the raw grade to [0,1] safely ---
+        # Treat -1 (sentinel) as "no progress" ONLY when actually navigating;
+        # otherwise ignore it (return 0.0 without side effects).
+        if raw_nav_grade < 0.0:
+            return 0.0
+
+        v = float(raw_nav_grade)
+        if v <= 0.0:
+            return 0.0
+        if v >= 1.0:
+            return 1.0
+        return v
+
+    
+    def _env_room_metrics(self,env):
+        """
+        Return (coverage in [0,1], complete flag).
+        Pulls the env’s authoritative room visit log if present, and the target count
+        via rooms_in_row/rooms_in_col. Designed to work with aisle_door_rooms.
+        """
+        e = getattr(env, "unwrapped", env)
+
+        visited_ids = set()
+        # 1) Authoritative discovery history (ordered list of {"room": (col,row), ...})
+        try:
+            for rec in list(e.get_visited_rooms_order()):
+                rid = rec.get("room")
+                if isinstance(rid, (tuple, list)) and len(rid) == 2:
+                    visited_ids.add((int(rid[0]), int(rid[1])))
+        except Exception:
+            pass
+
+        # Optional fast path: if the env exposes a private visited set, fuse it
+        try:
+            vset = getattr(e, "_visited_rooms_set", None)
+            if isinstance(vset, set):
+                visited_ids |= {tuple(v) if isinstance(v, (list, tuple)) else v for v in vset}
+        except Exception:
+            pass
+
+        # 2) Target total rooms from env metadata (rooms_in_row/rooms_in_col)
+        try:
+            n_row = int(getattr(e, "rooms_in_row"))
+            n_col = int(getattr(e, "rooms_in_col"))
+            total = max(1, n_row * n_col)
+        except Exception:
+            # Last resort: avoid deadlock if metadata is missing
+            total = max(1, len(visited_ids))
+
+        visited = len(visited_ids)
+        coverage = min(1.0, visited / float(total))
+        complete = (visited >= total)
+        return coverage, complete
 
     # -------------------- post-step update (HMM + bookkeeping) --------------------
     def post_step_update(self, obs: dict, belief_zd):
@@ -389,8 +491,10 @@ class KBrain:
         print(self.nav_system.current_mode)
         raw_plan_prog = self.nav_system.navigation_grade()
         print("NAV GRADE",raw_plan_prog)
-        hmm_plan_progress = max(0.0, min(1.0, 0.0 if raw_plan_prog == -1 else float(raw_plan_prog)))
+
+        hmm_plan_progress =self._compute_hmm_plan_progress(raw_plan_prog, grace_len=15)
         print("NAV GRADE",hmm_plan_progress)
+
         rb = self.replay_buffer
         # update mode (new HMM may not have submodes)
         _, stats = self.hmm_bayes.update(rb, hmm_info_gain, hmm_plan_progress)
@@ -713,13 +817,15 @@ if __name__ == "__main__":
         except Exception:
             n_row, n_col = 1, 1
         return {"n_row": n_row, "n_col": n_col, "max_steps": int(N_STEPS)}
+
+
     
-    CKPT        = "runs/mg_collision/20250704-220917/ckpt/iter05000.pt"
+    CKPT        = "20250704-220917/ckpt/iter05000.pt"
     N_STEPS     = 300            # run the novelty policy for this many env steps
     LOOKAHEAD   = 7             # A* novelty horizon
     K_RECENT    = 30            # how many recent embeddings to compare against
     METRIC      = "cos"         # "kl" | "cos" | "l2"
-    DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    DEVICE      = torch.device("cpu")
 
     # Debug/vis knobs
     DEBUG_PRINT          = True   # keep tree/top-K/action scores logs
