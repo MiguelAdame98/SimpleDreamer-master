@@ -45,6 +45,7 @@ from dataclasses import dataclass
 from typing import Optional, List, Tuple, Any, Dict
 import numpy as np
 import sys as _sys
+import math 
 
 
 _REPO_ROOT = str(Path(__file__).resolve().parents[1])  # one level up from dreamer_mg/
@@ -411,7 +412,9 @@ class WMPlanner:
         emap = self.cog.mg.experience_map
         self.emap=emap
     def load_world_model2(self,ckpt_path: str,
-                        config_yaml: str = "C:/Users/migue/hierarchical-nav/dreamer_mg/20250704-220917/config.yml"):
+                        config_yaml: str = "/Users/lab25/hierarchical-nav/dreamer_mg/runs/mg_collision/20250704-220917/config.yml"):
+
+
         """
         Returns an object with .encoder and .rssm that exactly match *any*
         Dreamer checkpoint – no manual YAML tweaks required.
@@ -965,20 +968,23 @@ class WMPlanner:
         return manh + turn
 
     def astar_prims(self,
-                wm,
-                belief_zd,                  # (z,h) (latent + RNN state) at the *start* frame
-                start: State,
-                goal:  State,
-                max_actions: int = 20,      # hard budget
-                num_rollouts: int = 6,
-                verbose: bool = False,
-                allow_partial: bool = False):
+            wm,
+            belief_zd,                  # (z,h) (latent + RNN state) at the *start* frame
+            start: State,
+            goal:  State,
+            max_actions: int = 20,      # hard budget
+            num_rollouts: int = 6,
+            verbose: bool = False,
+            allow_partial: bool = False):
         """
-        Changes vs your current version:
-        (A) MC forward-collision voting that samples beliefs *here* (not inside check_for_wall).
-        (B) 'More open' closed set: we only reject a popped state; children may re-enter
-            if they improve g_score (standard A* reopen behavior).
-        (+) Optional: Weighted A* via self.h_weight (default 1.0, same as before).
+        A* over primitive actions with MC forward-collision votes and reopen rule.
+
+        Return type:
+        - If allow_partial is False (default): returns a Tensor [T,3] (one-hot actions),
+            or an empty [0,3] tensor if unreachable.  (IDENTICAL to current behavior.)
+        - If allow_partial is True: returns (Tensor [T,3], meta) where
+            meta = {'reached_goal': bool, 'best_dist': float}
+            'best_dist' is the Euclidean XY distance of the nearest popped state to the goal.
         """
         import torch
         import torch.nn.functional as F
@@ -991,47 +997,41 @@ class WMPlanner:
                     'left'   : [0, 0, 1]}
             return torch.tensor([mapping[a] for a in seq], dtype=torch.float32)
 
+        # >>> CHANGED: tiny helper to pack legacy vs partial-aware returns
+        def _pack(seq: list[str], reached: bool, best_dist_val: float):
+            tens = to_onehot_tensor(seq)
+            if allow_partial:
+                return tens, {'reached_goal': bool(reached), 'best_dist': float(best_dist_val)}
+            else:
+                return tens
+
         # Monte-Carlo vote for "is there a wall straight ahead *now*?" by sampling *beliefs*.
         # We DO NOT step the environment; we sample latent z variants conditioned on current h.
-        # We then reuse your existing checker (is_wall_ahead_now) per sample.
         def mc_wall_ahead_vote(wm, belief, k: int, ratio: float, debug: bool = False) -> bool:
-            """
-            Returns True if 'blocked' by majority vote.
-            Sampling strategy:
-                - Try sampling z ~ p(z|h) via rssm.transition_model(h) k times; keep h fixed.
-                - If the model doesn't support that call, fall back to small Gaussian noise on z.
-            """
             z0, h0 = belief
             blocked = 0
             need = max(1, int(math.ceil(k * ratio)))  # votes needed to declare 'blocked'
             with torch.no_grad():
                 for i in range(k):
-                    # Try to sample a new z from the current h (no action applied)
                     z_s = None
                     try:
-                        # many Dreamer-style RSSMs allow transition_model(h) → (prior, z_sample)
                         _prior, z_s = wm.rssm.transition_model(h0)
                     except Exception:
-                        # fallback: light noise around current z
-                        print("   [MC] warning: rssm.transition_model(h) failed; using noisy z")
+                        if debug or verbose:
+                            print("   [MC] warning: rssm.transition_model(h) failed; using noisy z")
                         eps = getattr(self, "z_noise_std", 0.05)
                         z_s = z0 + torch.randn_like(z0) * eps
 
                     if hasattr(self, "is_wall_ahead_now"):
                         if self.is_wall_ahead_now(wm, (z_s, h0), debug=False):
                             blocked += 1
-                    else:
-                        # If you have a direct collision head, use it here instead.
-                        # raise RuntimeError("Need is_wall_ahead_now or a collision predictor.")
-                        # Conservative fallback: assume not blocked
-                        pass
 
                     # Early exit once the outcome is decided
                     if blocked >= need:
                         if debug or verbose:
                             print(f"   [MC] forward blocked by vote {blocked}/{i+1}")
                         return True
-                    if (i + 1 - blocked) > (k - need):  # cannot possibly reach 'need' anymore
+                    if (i + 1 - blocked) > (k - need):
                         break
 
             if debug or verbose:
@@ -1050,14 +1050,13 @@ class WMPlanner:
         # But children are allowed to re-enter if they improve g_score (reopen behavior).
         closed  = set()
 
-        # nearest fallback bookkeeping (only used if allow_partial=True)
+        # nearest fallback bookkeeping (used only if allow_partial=True)
         best_dist = float("inf")
         best_seq  = []
 
         while pq:
             f, g, (x, y, d), seq, belief = heapq.heappop(pq)
             if (x, y, d) in closed:
-                # If someone put a better g later, it would have been pushed with lower f and popped already.
                 continue
             closed.add((x, y, d))
 
@@ -1071,7 +1070,8 @@ class WMPlanner:
 
             # success
             if (x, y, d) == (goal.x, goal.y, goal.d):
-                return to_onehot_tensor(seq)  # ✔ exact plan
+                # >>> CHANGED: pack with reached=True if allow_partial else legacy tensor
+                return _pack(seq, True, 0.0)
 
             # budget check (pop boundary)
             if g >= max_actions:
@@ -1095,15 +1095,14 @@ class WMPlanner:
                 if g2 > max_actions:
                     continue
 
-                # ---- CHANGE (A): MC trimming for 'forward' ----
+                # ---- MC trimming for 'forward' ----
                 if act == "forward":
-                    # sample beliefs *here*, not inside is_wall_ahead_now
                     if mc_wall_ahead_vote(wm, belief, k=num_rollouts, ratio=MC_BLOCK_RATIO, debug=False):
                         if verbose:
                             print("   prune (MC vote: wall ahead now)  ->", seq + [act])
                         continue
 
-                # belief one step ahead (no-grad) — only now that we've decided to keep this child
+                # belief one step ahead (no-grad)
                 with torch.no_grad():
                     z, h = belief
                     onehot = F.one_hot(
@@ -1120,15 +1119,11 @@ class WMPlanner:
                 h2 = self.heuristic(ns, goal)
                 f2 = g2 + H_WEIGHT * h2
 
-                # ---- CHANGE (B): 'More open' closed set / standard A* re-open rule ----
-                # Do not flatly ban children just because the pose was popped before.
-                # Only push if this path improves the best known g for ns.
+                # ---- reopen rule: push only if we improve g(ns)
                 if g2 < g_score.get(ns, float("inf")):
                     g_score[ns] = g2
                     heapq.heappush(pq, (f2, g2, ns, new_seq, belief_next))
                 else:
-                    # If we already have an equal-or-better g for ns, skip.
-                    # (This still allows re-open if a genuinely better path shows up later.)
                     if verbose:
                         print(f"   skip {ns} (no g improvement)")
 
@@ -1136,11 +1131,15 @@ class WMPlanner:
         if allow_partial and best_seq:
             if verbose:
                 print(f"[A*] no path; returning NEAREST (len={len(best_seq)}, dist={best_dist:.2f})")
-            return to_onehot_tensor(best_seq)
+            # >>> CHANGED: pack with reached=False and best_dist
+            return _pack(best_seq, False, best_dist)
 
         if verbose:
             print("[A*] no path; returning EMPTY")
+        # legacy: unreachable → empty tensor
+        import torch
         return torch.empty((0, 3), dtype=torch.float32)
+
 
     def render_plan(self,wm, belief_zd, actions, include_last=True):
         """
@@ -2050,7 +2049,7 @@ class WMPlanner:
 
         best_action, action_scores, top_paths = self.first_action_from_topk_paths(
             tree,
-            k=5,                       # change if you want a different K
+            k=10,                       # change if you want a different K
             include_pruned=True,
             weight="linear",            # "linear" | "harmonic" | "exp"
             alpha=0.85,                 # only used for weight="exp"
@@ -2209,16 +2208,16 @@ class WMPlanner:
         # =========================
         Wp2e        = getattr(self, "rank_Wp2e", 1.0)       # weight for sibling-normalized p2e in step value
         gammaR      = getattr(self, "rank_gamma", 1.0)      # per-step discount in ranking sum (1.0 = none)
-        Bdist       = getattr(self, "rank_B", 0.8)         # weight for distance from start
-        Cgraph      = getattr(self, "rank_C", 1.2)         # weight for graph separation term
+        Bdist       = getattr(self, "rank_B", 1.0 )         # weight for distance from start
+        Cgraph      = getattr(self, "rank_C", 1.5)         # weight for graph separation term
         dist_metric = getattr(self, "rank_dist_metric", "manhattan")  # or "euclidean"
 
         # Graph aggregation controls
         graph_mode  = getattr(self, "rank_graph_mode", "rbf_softmin")  # "rbf_sep" | "knn_mean" | "power_mean" | "min" | "mean"
-        graph_sigma = float(getattr(self, "rank_graph_sigma", 2.5))# for rbf_sep: larger = broader influence (tiles)
+        graph_sigma = float(getattr(self, "rank_graph_sigma", 8.5))# for rbf_sep: larger = broader influence (tiles)
         graph_k     = int(getattr(self, "rank_graph_k", 3))        # for knn_mean
         graph_p     = float(getattr(self, "rank_graph_p", 2.0))    # for power_mean
-
+    
         # Optional:
         self.rank_dist_metric = "manhattan"  # or "euclidean"
         # =========================
@@ -2287,6 +2286,7 @@ class WMPlanner:
                 - min / mean:        obvious
                 Returns a value where LARGER means "farther from graph overall".
                 """
+                import math  
                 if not nodes_xy:
                     return 0.0
 
@@ -2304,26 +2304,21 @@ class WMPlanner:
                     sep = 1.0 - dens
                     return float(sep)
                 elif graph_mode == "rbf_softmin":
-                    import math
-
                     sigma = max(1e-6, graph_sigma)
                     W = nodes_w if nodes_w else [1.0] * len(D)
 
-                    # Stable soft-min: shift distances by the minimum to avoid tiny exponent issues.
+                    # Stable soft-min: shift by the minimum distance
                     d0 = min(D)
 
-                    # s = Σ w_i * exp(-(d_i - d0)/σ), so that softmin = d0 - σ * log(s)
+                    # Normalize by total weight to remove cluster/count bias
+                    wsum = max(sum(W), 1e-12)
                     s = 0.0
                     for d, w in zip(D, W):
                         s += w * math.exp(-(d - d0) / sigma)
+                    s /= wsum  # s ∈ (0, 1], independent of number of nodes
 
-                    # Prevent log(0); then compute softmin.
+                    # Soft-min, no zero clamp (keeps small but informative values)
                     d_softmin = d0 - sigma * math.log(max(s, 1e-12))
-
-                    # Multiple nearly-equal nearest nodes can make this slightly negative; clamp to 0.
-                    if d_softmin < 0.0:
-                        d_softmin = 0.0
-
                     return float(d_softmin)
 
                 elif graph_mode == "knn_mean":
@@ -2394,8 +2389,18 @@ class WMPlanner:
 
             dist_graph_all = 0.0
             if graph_nodes_xy:
-                dist_graph_all = _graph_separation(end_pose, graph_nodes_xy, graph_nodes_w)
-                print("[DEBUG cog2]",dist_graph_all)
+                use_path_min = bool(getattr(self, "rank_graph_use_path_min", True))
+                if use_path_min:
+                    poses = [getattr(n, "pose", None) for n in step_nodes if getattr(n, "pose", None) is not None]
+                    # Ensure end pose considered (in case last node lacks pose)
+                    if end_pose is not None and (not poses or poses[-1] != end_pose):
+                        poses.append(end_pose)
+                    vals = [_graph_separation(p, graph_nodes_xy, graph_nodes_w) for p in poses if p is not None]
+                    dist_graph_all = min(vals) if vals else 0.0
+                else:
+                    dist_graph_all = _graph_separation(end_pose, graph_nodes_xy, graph_nodes_w)
+
+                print("[DEBUG cog2]", dist_graph_all)
 
             score = float(new_gain + Bdist * dist_start + Cgraph * dist_graph_all)
 

@@ -4,7 +4,9 @@ from typing import List, Optional, Tuple, Dict, Any
 from importlib import util
 # or
 from importlib.util import spec_from_file_location, module_from_spec
-
+import os
+import logging
+logging.basicConfig(level=logging.INFO)
 # point "dreamer" to dreamer_mg.dreamer
 pkg_path = pathlib.Path(__file__).parent / "dreamer"
 spec = importlib.util.spec_from_file_location("dreamer", pkg_path / "__init__.py")
@@ -133,6 +135,8 @@ class KBrain:
         self.submode_changed: bool = False
         self.hmm_stats: dict | None = None
 
+        
+
         # ── Manager + configs (allocentric + memory)
         #     We pass a minimal, robust set: possible_actions = [[1,0,0],[0,1,0],[0,0,1]]
         forward = [1,0,0]
@@ -147,6 +151,29 @@ class KBrain:
             lambda: self.agent_current_pose,
             planner=self.planner
         )
+        self.nav_system._last_mode = None
+        self._captured_node_media_ids: set[int] = set()  # nodes we've saved media for (this run)
+
+        self.plan_export = getattr(self.nav_system, "plan_export", None)  # may be None in EXPLORE
+        self._pending_node_media = []   # [(node_id, snapshot, enhanced_dict)]
+        self._captured_node_media_ids = set()  # you created this set, use it
+
+        # Cache the latest agent FoV (HWC uint8) and expose it to NavigationSystem.
+        self._last_fov_image = None
+
+        def _fov():
+            # Prefer the egocentric FoV captured from obs["image"] each step.
+            img = getattr(self, "_last_fov_image", None)
+            if img is not None:
+                return img
+            
+        self.nav_system.get_fov_image = _fov
+        # Keep a local latch the exporter can read *every step*
+        self._latest_fov = None
+        self.nav_system.get_fov_image = lambda: getattr(self, "_latest_fov", None)
+
+
+
         self.nav_system.debug_universal_navigation = True
 
     # -------------------- action encodings --------------------
@@ -210,6 +237,9 @@ class KBrain:
             return self.env.actions.left
         raise ValueError(f"Unrecognized onehot action: {onehot}")
 
+    def _exporter(self):
+        return getattr(self, "plan_export", None) or getattr(self.nav_system, "plan_export", None)
+
     # -------------------- brains: policy selection --------------------
     def apply_exploration(self, start_state, t_step: int) -> str:
         """
@@ -234,13 +264,6 @@ class KBrain:
                 print(f"[NAVIGATE] STALL → issuing {fallback}")
                 return fallback, 1
 
-            # ---------- 2. Build first plan if none ----------
-            if self.nav_system.progress_scalar() < 0.0:
-                print("[NAVIGATE] no plan yet → building PCFG plan")
-                grammar = self.nav_system.build_pcfg_from_memory()
-                self.nav_system.generate_plan_with_pcfg(grammar)
-                print(f"[NAVIGATE] new plan tokens={self.nav_system.full_plan_tokens}")
-
             # ---------- 3. Delegate to sub-mode handler ----------
             primitives, n_actions = self.nav_system.universal_navigation(submode, self.wm, self.belief)
             if not primitives or n_actions == 0:
@@ -258,31 +281,44 @@ class KBrain:
             def _task_gate_all_rooms_env():
                 """
                 Gate TASK_SOLVING strictly by the environment's own room-visit bookkeeping.
-                Uses:
-                - env.unwrapped.get_visited_rooms_order()  → authoritative discovery history
-                - env.unwrapped.rooms_in_row / rooms_in_col → target coverage
+                Robust to different shapes returned by env.unwrapped.get_visited_rooms_order()
+                (dicts, tuples, lists).
                 """
                 e = getattr(self.env, "unwrapped", self.env)
 
                 # 1) Pull visited rooms from the env (authoritative)
                 visited_room_ids = set()
+                ord_list = []
                 try:
-                    ord_list = list(e.get_visited_rooms_order())  # [{'room': (col,row), 'color': str, ...}, ...]
+                    ord_raw = e.get_visited_rooms_order()
+                    # Normalize to a flat iterable
+                    if ord_raw is None:
+                        ord_list = []
+                    elif isinstance(ord_raw, (list, tuple, set)):
+                        ord_list = list(ord_raw)
+                    else:
+                        # last resort: try to iterate
+                        try:
+                            ord_list = list(ord_raw)
+                        except Exception:
+                            ord_list = []
+                    # Accept both dict records and bare (col,row) pairs
                     for rec in ord_list:
-                        rid = rec.get("room")
-                        if isinstance(rid, tuple) and len(rid) == 2:
-                            visited_room_ids.add((int(rid[0]), int(rid[1])))
-                        elif isinstance(rid, list) and len(rid) == 2:
+                        rid = None
+                        if isinstance(rec, dict):
+                            rid = rec.get("room", None)
+                        elif isinstance(rec, (tuple, list)) and len(rec) >= 2:
+                            # treat as (col,row,...) or [col,row,...]
+                            rid = (rec[0], rec[1])
+                        if isinstance(rid, (tuple, list)) and len(rid) == 2:
                             visited_room_ids.add((int(rid[0]), int(rid[1])))
                 except Exception as ex:
                     print(f"[TASK][gate] get_visited_rooms_order() unavailable: {ex}")
-                    ord_list = []
 
                 # Optional: if the env exposes the private set, use it too (faster / exact)
                 try:
                     vset = getattr(e, "_visited_rooms_set", None)
                     if isinstance(vset, set) and len(vset) > 0:
-                        # entries are already (col,row) tuples
                         visited_room_ids |= {tuple(v) if isinstance(v, (list, tuple)) else v for v in vset}
                 except Exception:
                     pass
@@ -294,7 +330,6 @@ class KBrain:
                     total = n_row * n_col
                 except Exception as ex:
                     print(f"[TASK][gate] rooms_in_row/rooms_in_col missing: {ex}")
-                    # Last resort to avoid deadlock: assume at least the number we've seen
                     total = max(1, len(visited_room_ids))
 
                 # 3) Decide
@@ -303,37 +338,24 @@ class KBrain:
                 print(f"[TASK][gate] rooms covered: {visited}/{total} → {'READY' if ready else 'NOT READY'}")
                 return ready, {"visited": visited, "target": total}
 
-
             ready, gate_info = _task_gate_all_rooms_env()
             if not ready:
                 print(f"[TASK] Not ready to enter TASK_SOLVING (gate={gate_info}) → fallback random turn.")
                 return random.choice(["right", "left"])
+            self.nav_system.current_mode = "TASK_SOLVING"
+            self.nav_system.ensure_plan_for_current_mode(debug=True)
+            # Then just drive with the universal executor:
+            primitives, n_actions = self.nav_system.universal_navigation(submode, wm, belief)
+            print("[TASK] new plan tokens",primitives)
 
-            # ---- Same early feasibility gate as NAVIGATE
-            if not self.nav_system.check_navigation_feasibility():
-                print(f"[TASK] infeasible — flags={self.nav_system.navigation_flags}")
-                self.navigation_flags = self.nav_system.navigation_flags
-                return random.choice(["right", "left"])
+            if n_actions == 0:
+                # Emit a turn ONLY to satisfy the outer executor, but ignore in grading.
+                fb, n2, label = self.nav_system.emit_stall_turn(for_executor=True)
+                return label  # 'left' or 'right'
 
-            # ---- Build task plan (first time only), using the task-specific PCFG
-            if self.nav_system.progress_scalar() < 0.0:
-                mission = self.nav_system.task_solve_mission()  # e.g., "go to red room"
-                color   = self.nav_system._parse_color_from_mission(mission)
-                if not color:
-                    print(f"[TASK] Could not parse mission color from: {mission!r} → fallback turn.")
-                    return random.choice(["right", "left"])
-
-                grammar = self.nav_system.build_task_pcfg_from_memory(color, debug=True)
-                self.nav_system.generate_plan_with_pcfg(grammar)
-                print(f"[TASK] new plan tokens={self.nav_system.full_plan_tokens}  mission={mission}  color={color}")
-
-            # ---- Delegate to the same sub-mode handler you use for NAVIGATE
-            primitives, n_actions = self.nav_system.universal_navigation(submode, self.wm, self.belief)
-            if not primitives or n_actions == 0:
-                return random.choice(["right", "left"])
-
+            # Normal path:
             act = self._onehot_to_name(primitives[0])
-            return act or random.choice(["right", "left"])
+            return act
 
         # 4) EXPLORE (default): call your novelty A* and choose the *next* action
         result = self.planner.novelty_astar_plan(
@@ -471,24 +493,277 @@ class KBrain:
         complete = (visited >= total)
         return coverage, complete
 
+    
+
+    def _maybe_capture_node_creation(self, obs: dict, belief_zd, wm=None):
+        import numpy as np, torch, os
+
+        # ---------- figure out target spatial size from the current obs ----------
+        # falls back to 64x64 if obs is not present
+        if isinstance(obs, dict) and isinstance(obs.get("image", None), np.ndarray) and obs["image"].ndim == 3:
+            H, W = int(obs["image"].shape[0]), int(obs["image"].shape[1])
+        else:
+            H, W = 64, 64  # <- same size you use in DictResizeObs
+
+        def _rehydrate_flat_embed_to_img(vec, H=H, W=W, expect_c=(3,1)):
+            """vec -> HWC uint8. Tries 3*H*W first (CHW), then 1*H*W (grayscale)."""
+            if vec is None:
+                return None
+            v = torch.as_tensor(vec).detach().cpu().float().view(-1).numpy()
+            L = v.size
+
+            img = None
+            # case A: 3xHxW (common in your decode/render code)
+            if L == 3 * H * W:
+                chw = v.reshape(3, H, W)                 # CHW
+                hwc = np.transpose(chw, (1, 2, 0))       # HWC
+                img = hwc
+            # case B: 1xHxW (occasionally single channel)
+            elif L == H * W:
+                g = v.reshape(H, W)
+                img = np.repeat(g[..., None], 3, axis=2) # HWC(3)
+
+            if img is None:
+                return None
+
+            # normalize range robustly: supports [-0.5,0.5], [0,1], or arbitrary floats
+            amin, amax = float(img.min()), float(img.max())
+            if amin >= -0.55 and amax <= 0.55:
+                img = np.clip(img + 0.5, 0.0, 1.0)
+            elif amin >= 0.0 and amax <= 1.2:
+                img = np.clip(img, 0.0, 1.0)
+            else:
+                rng = max(1e-8, amax - amin)
+                img = (img - amin) / rng
+
+            return (img * 255.0).astype(np.uint8)
+
+        # ---------- keep your existing helpers ----------
+        def first_not_none(*vals):
+            for v in vals:
+                if v is not None: return v
+            return None
+
+        def unwrap_img(x):
+            if x is None: return None
+            if isinstance(x, dict):
+                # prefer real/decoded images if present
+                im = first_not_none(
+                    x.get("imagined_image", None),
+                    x.get("decoded_image",  None),
+                    x.get("image",          None),
+                    x.get("img",            None),
+                    x.get("frame",          None),
+                    x.get("pred",           None),
+                )
+                if im is not None:
+                    return im
+                # otherwise: this is the fix — rehydrate the flattened predicted frame
+                emb = x.get("embed", None)
+                reh = _rehydrate_flat_embed_to_img(emb)
+                if reh is not None:
+                    return reh
+                # last resort: keep your old gray tile viz as a fallback
+                return _viz_embed_to_image(emb)
+            return x
+
+        def is_present_image(x):
+            if x is None: return False
+            if isinstance(x, np.ndarray): return x.size > 0
+            if torch.is_tensor(x):        return x.numel() > 0
+            return True
+
+        # ----------------- (rest of your function is unchanged) -----------------
+        try:
+            emap = getattr(self.planner, "emap", None)
+            e = None if emap is None else getattr(emap, "current_exp", None)
+            if e is None:
+                return
+
+            nid = int(e.id)
+            captured = getattr(self, "_captured_node_media_ids", None)
+            if captured is None:
+                captured = set(); self._captured_node_media_ids = captured
+            if nid in captured:
+                return
+
+            snap_src = first_not_none(
+                obs.get("imagined_image", None),
+                obs.get("decoded_image",  None),
+                obs.get("image",          None),
+            ) if isinstance(obs, dict) else None
+
+            snap = unwrap_img(snap_src)
+            if not is_present_image(snap):
+                snap = None
+
+            enhanced = None
+            try:
+                if self.planner is not None:
+                    combos = [('left',), ('right',), ('left','left'), ('right','right')]
+                    label_of = {('left',): 'L', ('right',): 'R', ('left','left'): 'LL', ('right','right'): 'RR'}
+                    ep = self.planner.build_enhanced_perception(wm, belief_zd, combos=combos)
+
+                    out = {}
+                    if isinstance(ep, dict):
+                        for k in combos:
+                            lab = label_of[k]
+                            val = ep.get(k, None) or ep.get(lab, None)
+                            val = unwrap_img(val)                      # <- now restores from 'embed'
+                            if is_present_image(val):
+                                out[lab] = val
+                    elif isinstance(ep, (list, tuple)):
+                        for item in ep:
+                            if not isinstance(item, dict): continue
+                            lab = label_of.get(tuple(item.get('seq', ())), None)
+                            if not lab: continue
+                            val = unwrap_img(item)                      # <- now restores from 'embed'
+                            if is_present_image(val):
+                                out[lab] = val
+                    if out:
+                        enhanced = out
+            except Exception as ee:
+                try:
+                    if hasattr(self, "plan_export") and self.plan_export is not None:
+                        self.plan_export.log_event("enhanced_preds_error", node_id=nid, err=str(ee))
+                except Exception:
+                    pass
+                enhanced = None
+
+            ready = hasattr(self, "plan_export") and (self.plan_export is not None) \
+                    and (getattr(self.plan_export, "run_dir", None) is not None)
+            if not ready:
+                pend = getattr(self, "_pending_node_media", None) or []
+                self._pending_node_media = pend
+                pend.append((nid, snap, enhanced))
+                captured.add(nid)
+                return
+
+            rels = self.plan_export.node_created(
+                node_id=nid,
+                snapshot_img=snap if snap is not None else None,
+                enhanced_pred_imgs=enhanced if (enhanced is not None and len(enhanced) > 0) else None,
+            )
+            captured.add(nid)
+    
+            print("[node_media] what goes into rels", rels)
+
+            # mirror absolute paths on Experience (optional)
+            try:
+                run_dir = getattr(self.plan_export, "run_dir", None)
+                if run_dir and isinstance(rels, dict):
+                    if isinstance(rels.get("snapshot", None), str):
+                        e.media_snapshot_path = os.path.join(run_dir, rels["snapshot"])
+                    enh_map = rels.get("enhanced", {}) or {}
+                    if isinstance(enh_map, dict):
+                        e.media_enhanced_preds_paths = [
+                            os.path.join(run_dir, p) for p in enh_map.values() if isinstance(p, str)
+                        ]
+            except Exception:
+                pass
+
+            # Log success & mark captured
+            try:
+                n_enh = len(rels.get("enhanced", {})) if isinstance(rels, dict) else 0
+                if hasattr(self, "plan_export") and self.plan_export is not None:
+                    self.plan_export.log_event(
+                        "node_media_saved",
+                        node_id=nid,
+                        has_snapshot=bool(isinstance(rels, dict) and rels.get("snapshot")),
+                        n_enhanced=int(n_enh),
+                    )
+            except Exception:
+                pass
+
+            captured.add(nid)
+
+        except Exception as ex:
+            # Last resort logging; DO NOT crash the control loop
+            try:
+                if hasattr(self, "plan_export") and self.plan_export is not None:
+                    # add extra context to debug similar issues fast
+                    def _shape_of(x):
+                        try:
+                            import numpy as _np, torch as _th
+                            if isinstance(x, _np.ndarray):
+                                return f"np{list(x.shape)} {x.dtype}"
+                            if _th.is_tensor(x):
+                                return f"th{list(x.shape)} {x.dtype}"
+                        except Exception:
+                            pass
+                        return type(x).__name__
+                    info = {
+                        "has_obs": isinstance(obs, dict),
+                        "imagined_t": _shape_of(obs.get("imagined_image", None)) if isinstance(obs, dict) else None,
+                        "decoded_t":  _shape_of(obs.get("decoded_image",  None)) if isinstance(obs, dict) else None,
+                        "real_t":     _shape_of(obs.get("image",          None)) if isinstance(obs, dict) else None,
+                    }
+                    self.plan_export.log_event("node_media_capture_error", err=str(ex), **info)
+            except Exception:
+                pass
+
+
+
+
+
+
     # -------------------- post-step update (HMM + bookkeeping) --------------------
     def post_step_update(self, obs: dict, belief_zd):
         """
         Call this RIGHT AFTER you step + update belief + update_cog in your loop.
         It updates nav pose, computes info-gain & plan-progress, and updates HMM.
         """
+        # Cache the agent's FoV so NavigationSystem’s exporter can save it on node arrival.
+        try:
+            if isinstance(obs, dict) and "image" in obs and obs["image"] is not None:
+                # Expect HxWx3 uint8 from RGBImgPartialObsWrapper + DictResizeObs
+                self._last_fov_image = obs["image"]
+        except Exception:
+            pass
+        self._latest_fov = obs.get("image", None)  # make FoV available to NavigationSystem exporter
+        try:
+            exp = self._exporter()
+            if exp and getattr(self, "_pending_node_media", None):
+                pending = getattr(self, "_pending_node_media")
+                while pending:
+                    nid, snap, enh = pending.pop(0)
+                    try:
+                        rels = exp.node_created(node_id=int(nid), snapshot_img=snap, enhanced_pred_imgs=enh)
+                        try:
+                            run_dir = getattr(exp, "run_dir", None)
+                            if run_dir and hasattr(self.planner, "emap"):
+                                e = getattr(self.planner.emap, "get_exp_by_id", lambda _: None)(nid) or getattr(self.planner.emap, "current_exp", None)
+                                if e and int(getattr(e, "id", -1)) == int(nid):
+                                    if rels.get("snapshot"):
+                                        e.media_snapshot_path = os.path.join(run_dir, rels["snapshot"])
+                                    if rels.get("enhanced"):
+                                        e.media_enhanced_preds_paths = [os.path.join(run_dir, p) for p in rels["enhanced"].values() if p]
+                        except Exception:
+                            pass
+                        try:
+                            exp.log_event("node_media_flushed", node_id=int(nid))
+                        except Exception:
+                            pass
+                        print(f"[node_media] flushed node {nid}")
+                    except Exception as ex:
+                        print(f"[node_media] flush failed for node {nid}: {ex}")
+                        try:
+                            exp.log_event("node_media_flush_error", node_id=int(nid), err=str(ex))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
         # track pose for NavigationSystem callbacks
         self.agent_current_pose = tuple(obs["pose"]) if "pose" in obs else None
         try:
             self.nav_system.push_pose(self.agent_current_pose)
         except Exception:
             pass
-
+        
         # HMM signals
         #hmm_info_gain = self.info_gain(obs.get('image'), obs.get('pose'), self.replay_buffer, self.planner.emap)
         hmm_info_gain=None
-        self.nav_system.current_mode=self.current_mode
-        print(self.nav_system.current_mode)
         raw_plan_prog = self.nav_system.navigation_grade()
         print("NAV GRADE",raw_plan_prog)
 
@@ -509,7 +784,12 @@ class KBrain:
 
         self.prev_mode, self.prev_submode = self.current_mode, self.current_submode
         self.current_mode, self.current_submode = new_mode, new_submode
+        
         self.mode_changed = (new_mode != self.prev_mode)
+        self.nav_system.set_mode(new_mode)     # this calls _on_mode_transition(...) inside NavigationSystem
+        if new_mode != getattr(self, "current_mode", None) or not hasattr(self, "_first_mode_set"):
+            self._first_mode_set = True
+        print("self.nav_system.current_mode",self.nav_system.current_mode)
         self.submode_changed = (new_submode != self.prev_submode)
         self.hmm_stats = stats
 
@@ -820,8 +1100,8 @@ if __name__ == "__main__":
 
 
     
-    CKPT        = "20250704-220917/ckpt/iter05000.pt"
-    N_STEPS     = 300            # run the novelty policy for this many env steps
+    CKPT        = "runs/mg_collision/20250704-220917/ckpt/iter05000.pt"
+    N_STEPS     = 1200            # run the novelty policy for this many env steps
     LOOKAHEAD   = 7             # A* novelty horizon
     K_RECENT    = 30            # how many recent embeddings to compare against
     METRIC      = "cos"         # "kl" | "cos" | "l2"
@@ -844,8 +1124,10 @@ if __name__ == "__main__":
     print("✓ world-model loaded")
     
 
-    env = gym.make("MiniGrid-4-tiles-ad-rooms-v0", rooms_in_row=3, rooms_in_col=4, max_steps=None)
-    env.seed(218)
+    env = gym.make("MiniGrid-4-tiles-ad-rooms-v0", rooms_in_row=5, rooms_in_col=5, max_steps=None)
+    #env.seed(218)
+    #env.seed(217)
+    env.seed(915)
     env = RGBImgPartialObsWrapper(env)
     env = ImgActionObsWrapper(env)
     env = DictResizeObs(env, (64, 64))
@@ -876,7 +1158,9 @@ if __name__ == "__main__":
 
         memcfg_path=str(MEMCFG),         # your memory_graph_config.yml
         replay_buffer=lambda: replay_buffer)
-
+    if hasattr(brain.nav_system.memory_graph, "odom") and hasattr(brain.nav_system.memory_graph.odom, "bootstrap"):
+        print("are we BOOTSTRAPPING?")
+        brain.nav_system.memory_graph.odom.bootstrap([0,0,0])
 
     collage = DualPathCollage(
         out_dir="dbg/collages",
@@ -944,12 +1228,23 @@ if __name__ == "__main__":
                     + (f" ({e.room_color})" if e.room_color else ""))
                 node_id=e.id
                 print("NODE ID", node_id)
+            
             else:
                 node_id=None
+    
+            brain._maybe_capture_node_creation(next_obs, belief,wm)
             # --- push transition to replay buffer (includes decoded prediction) ---
             print("NODE ID", node_id)
+            print("ROOMS",brain.hmm_bayes.hhmm._env_room_metrics(env))
             append_to_replay_buffer(replay_buffer, next_obs, env_act, belief,node_id)
             brain.belief = belief
+            if brain.nav_system.consume_task_mutation_armed():          # preferred (clears the latch)
+                print("MUTATIIIINNG")
+                env.unwrapped.MutateConnectivity(
+                    cutoff_rooms_rate=0.15,
+                    front_obstacle_rate=0.0,
+                    seed=123
+                )
             brain.post_step_update(next_obs, belief)
             # --- Build per-step data payload for the recorder ---
             try:
@@ -985,12 +1280,12 @@ if __name__ == "__main__":
                     "pose": next_obs.get("pose"),
                     # HMM block (stubs — fill these when you wire your HMM stats)
                     "recommended_mode": brain.current_mode,
-                    # "mode_confidence": 0.0,
+                    #"mode_confidence": 0.0,
                     # "submode_confidence": 0.0,
                     # "uncertainty": 0.0,
                     # "changepoint_mass": 0.0,
                 }
-                print("[DIAG] frame slots:",
+                print("[DIAG] frame slots:","pose",next_obs.get("pose"),"global P",GP,
                     "env", type(env_img), getattr(env_img, "shape", None),
                     "gt", type(next_obs.get("image")), getattr(next_obs.get("image"), "shape", None),
                     "dec", type(decoded_img), getattr(decoded_img, "shape", None))
@@ -1009,7 +1304,7 @@ if __name__ == "__main__":
                 print("[RECORDER] frame failed:", e)
             # --- debug prints / tree / top-K paths ---
             if DEBUG_PRINT:
-                print(f"[t={t:02d}] chose action → {action_name}")
+                print(f"[t={t:02d}] choose action → {action_name}")
                 # if internal records exist, echo them (kept from your probe block)
                 tree = getattr(planner, "_last_decision_tree", None)
                 if hasattr(planner, "_last_top_paths"):
