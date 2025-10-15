@@ -90,11 +90,11 @@ def set_paper_theme():
 # Grouped bars: 3 bars (models) per environment
 # =========================================================
 
-# ---------- REPLACE WITH YOUR DATA (percent, 0–100) ----------
+
 coverage_pct = {
-    "Only Dreamer": np.array([100.0, 60.0, 40.0]),
-    "Full model- no bias": np.array([95.0, 75.0, 30.0]),
-    "Full model (HMM+Cognitive graph+Dreamer)": np.array([100.0, 100.0, 92.0]),
+    "Only Dreamer": np.array([100.0, 38.0, 22.0]),
+    "Full model- no bias": np.array([95.0, 64.0, 27.0]),
+    "Full model (HMM+Cognitive graph+Dreamer)": np.array([100.0, 100.0, 96.0]),
 }
 # ------------------------------------------------------------
 
@@ -163,15 +163,36 @@ def plot_percentage_bars(coverage_pct_dict, panel_label="A"):
 # =========================================================
 
 # ---------- REPLACE WITH YOUR DATA (steps to full coverage) ----------
-def _synth_runs(base, spread=18, n_runs=10):
-    base = np.asarray(base, dtype=float)
-    noise = rng.normal(0.0, spread, size=(n_runs, len(base)))
-    return np.clip(base + noise, a_min=1.0, a_max=None)
-
+# ---------- EXPLICIT DATA ARRAYS (steps to full coverage) ----------
+# Columns = [Env1, Env2, Env3]
+# ---------- EXPLICIT DATA ARRAYS (steps to full coverage) ----------
+# Columns = [Env1, Env2, Env3]
 coverage_steps_by_model = {
-    "Full model (HMM+Cognitive graph+Dreamer)": _synth_runs([260, 410, 580], spread=16, n_runs=12),
-    "Only Dreamer": _synth_runs([300, 520, 780], spread=22, n_runs=12),
-    "Full model- no bias": _synth_runs([280, 480, 820], spread=20, n_runs=12),
+    "Full model (HMM+Cognitive graph+Dreamer)": np.array([
+        [155, 938, 1267],
+        [269, 946, 1521],
+        [202, 560, 2241],
+        [151, 551, 1290],
+        [174, 584, 2431],
+        [159, 1124, 1789],
+        [261, 887, 1657],
+        [229, 657, 1820],
+
+    ], dtype=float),
+
+    "Only Dreamer": np.array([
+        [252, 2140, 4779],
+        [189, 2338, 5694],
+
+    ], dtype=float),
+
+    "Full model- no bias": np.array([
+        [312, 1512, 5901],
+        [246, 2763, 5870],
+        [334, 1831, 5202],
+
+
+    ], dtype=float),
 }
 # ------------------------------------------------------------
 
